@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Build output
+backend/bin/
+backend/tmp/
+frontend/.svelte-kit/
+frontend/build/
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# OS files (Windows)
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# IDE
+.vscode/
+.idea/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# SvelteKit
+frontend/.svelte-kit/
+
+# Uploaded files (don't commit user data)
+backend/uploads/
+uploads/

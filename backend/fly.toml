@@ -1,0 +1,53 @@
+# BurnerBox Backend — Fly.io Configuration
+# Docs: https://fly.io/docs/reference/configuration/
+
+app = "burnerbox-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# ---- HTTP Service ----
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 250
+    soft_limit = 200
+
+# ---- Machine sizing ----
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# ---- Persistent storage for file uploads ----
+# Encrypted at rest by Fly.io. Survives machine restarts and deploys.
+[mounts]
+  source = "burnerbox_uploads"
+  destination = "/app/uploads"
+
+# ---- Health checks ----
+[checks]
+  [checks.health]
+    interval = "10s"
+    timeout = "5s"
+    grace_period = "5s"
+    method = "GET"
+    path = "/api/health"
+
+# ---- Secrets (set via `fly secrets set`, never committed) ----
+# Required secrets:
+#   DATABASE_URL          — PostgreSQL connection string
+#   JWT_SECRET            — HMAC signing key for JWTs (generate with: openssl rand -base64 64)
+#   TOTP_ENCRYPTION_KEY   — AES-256 key, base64-encoded (generate with: openssl rand -base64 32)
+#   FILE_ENCRYPTION_KEY   — AES-256 key, base64-encoded (generate with: openssl rand -base64 32)
+#
+# Optional secrets:
+#   CORS_ORIGINS          — Comma-separated allowed origins (e.g. "https://burnerbox.example.com")
+#   API_URL               — Public URL of this API (e.g. "https://api.burnerbox.example.com")
+#   SUBMISSION_URL_PREFIX — Full URL prefix for submission links
