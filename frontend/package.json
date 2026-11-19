@@ -7,7 +7,8 @@
 		"dev": "vite dev",
 		"build": "vite build",
 		"preview": "vite preview",
-		"prepare": "svelte-kit sync || echo ''"
+		"prepare": "svelte-kit sync || echo ''",
+		"test": "vitest run"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-cloudflare": "^7.2.9",
@@ -17,11 +18,13 @@
 		"@types/libsodium-wrappers": "^0.7.14",
 		"svelte": "^5.56.1",
 		"tailwindcss": "^4.3.3",
-		"vite": "^8.0.16"
+		"vite": "^8.0.16",
+		"vitest": "^4.1.11"
 	},
 	"dependencies": {
 		"jszip": "^3.10.1",
 		"libsodium-wrappers": "^0.8.4",
-		"marked": "^18.0.10"
+		"marked": "^18.0.10",
+		"openpgp": "^6.3.1"
 	}
 }

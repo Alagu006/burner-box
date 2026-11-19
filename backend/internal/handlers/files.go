@@ -25,7 +25,7 @@ import (
 
 const (
 	MaxFileSize  = 10 * 1024 * 1024 // 10MB max per file
-	AllowedTypes = ".jpg,.jpeg,.png,.gif,.pdf,.txt,.doc,.docx,.mp4,.mp3,.zip"
+	AllowedTypes = ".jpg,.jpeg,.png,.gif,.pdf,.txt,.doc,.docx,.mp4,.mp3,.wav,.zip"
 
 	// Input length limits — enforced server-side to prevent abuse and
 	// keep the database reasonable.
@@ -41,15 +41,18 @@ const (
 
 // mimeToExt maps MIME types detected by http.DetectContentType to canonical extensions
 var mimeToExt = map[string]string{
-	"image/jpeg":  ".jpeg",
-	"image/png":   ".png",
-	"image/gif":   ".gif",
-	"application/pdf": ".pdf",
-	"text/plain":      ".txt",
-	"application/msword":          ".doc",
+	"image/jpeg":         ".jpeg",
+	"image/png":          ".png",
+	"image/gif":          ".gif",
+	"application/pdf":    ".pdf",
+	"text/plain":         ".txt",
+	"application/msword": ".doc",
 	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-	"video/mp4":   ".mp4",
-	"audio/mpeg":  ".mp3",
+	"video/mp4":       ".mp4",
+	"audio/mpeg":      ".mp3",
+	"audio/wave":      ".wav",
+	"audio/wav":       ".wav",
+	"audio/x-wav":     ".wav",
 	"application/zip": ".zip",
 }
 
@@ -177,10 +180,9 @@ func processAndEncryptFile(submissionID string, file *multipart.FileHeader, ext 
 	case "image/jpeg", "image/png", "image/gif":
 		stripped, stripErr := stripImageMetadata(raw, mimeType)
 		if stripErr != nil {
-			log.Printf("metadata stripping failed for submission %s: %v (saving original)", submissionID, stripErr)
-		} else {
-			raw = stripped
+			return "", "", fmt.Errorf("metadata stripping failed: %w", stripErr)
 		}
+		raw = stripped
 	}
 
 	// 3) Server-side AES-256-GCM encryption

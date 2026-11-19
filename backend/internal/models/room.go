@@ -12,13 +12,14 @@ import (
 
 // Room represents an ephemeral secure room with optional password protection
 type Room struct {
-	ID              uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	RoomCode        string     `gorm:"size:32;uniqueIndex;not null" json:"room_code"`
-	PasswordHash    string     `gorm:"type:text" json:"-"`
-	MaxParticipants int        `gorm:"default:10" json:"max_participants"`
-	ExpiresAt       time.Time  `gorm:"not null" json:"expires_at"`
-	DestroyedAt     *time.Time `json:"destroyed_at,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
+	ID               uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	RoomCode         string     `gorm:"size:32;uniqueIndex;not null" json:"room_code"`
+	PasswordHash     string     `gorm:"type:text" json:"-"`
+	CreatorTokenHash string     `gorm:"type:varchar(64);not null;default:''" json:"-"`
+	MaxParticipants  int        `gorm:"default:10" json:"max_participants"`
+	ExpiresAt        time.Time  `gorm:"not null" json:"expires_at"`
+	DestroyedAt      *time.Time `json:"destroyed_at,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
 // RoomMessage represents a single message in an ephemeral room
@@ -34,27 +35,27 @@ type RoomMessage struct {
 
 // RoomFile represents an encrypted file attachment in a room
 type RoomFile struct {
-	ID              uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	RoomCode        string     `gorm:"size:32;index;not null" json:"room_code"`
-	SenderTag       string     `gorm:"size:50;not null" json:"sender_tag"`
-	OriginalName    string     `gorm:"size:255;not null" json:"original_name"`
-	MimeType        string     `gorm:"size:127" json:"mime_type"`
-	FileSize        int64      `gorm:"not null" json:"file_size"`
-	EncryptedData   []byte     `gorm:"type:bytea;not null" json:"-"`
-	EncryptionMeta  string     `gorm:"type:text" json:"encryption_meta"`
-	SelfDestructAt  *time.Time `json:"self_destruct_at,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
+	ID             uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	RoomCode       string     `gorm:"size:32;index;not null" json:"room_code"`
+	SenderTag      string     `gorm:"size:50;not null" json:"sender_tag"`
+	OriginalName   string     `gorm:"size:255;not null" json:"original_name"`
+	MimeType       string     `gorm:"size:127" json:"mime_type"`
+	FileSize       int64      `gorm:"not null" json:"file_size"`
+	EncryptedData  []byte     `gorm:"type:bytea;not null" json:"-"`
+	EncryptionMeta string     `gorm:"type:text" json:"encryption_meta"`
+	SelfDestructAt *time.Time `json:"self_destruct_at,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
 
 // RoomReaction represents an encrypted emoji reaction on a message
 type RoomReaction struct {
-	ID               uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	RoomCode         string    `gorm:"size:32;index;not null" json:"room_code"`
-	MessageID        uuid.UUID `gorm:"type:uuid;index;not null" json:"message_id"`
-	SenderTag        string    `gorm:"size:50;not null" json:"sender_tag"`
-	EncryptedEmoji   string    `gorm:"type:text;not null" json:"encrypted_emoji"`
-	EncryptionMeta   string    `gorm:"type:text" json:"encryption_meta"`
-	CreatedAt        time.Time `json:"created_at"`
+	ID             uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	RoomCode       string    `gorm:"size:32;index;not null" json:"room_code"`
+	MessageID      uuid.UUID `gorm:"type:uuid;index;not null" json:"message_id"`
+	SenderTag      string    `gorm:"size:50;not null" json:"sender_tag"`
+	EncryptedEmoji string    `gorm:"type:text;not null" json:"encrypted_emoji"`
+	EncryptionMeta string    `gorm:"type:text" json:"encryption_meta"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // GenerateRoomCode creates a cryptographically random room code (16 hex chars)

@@ -161,3 +161,20 @@ func RateLimitReplies(rl *authRateLimiter) fiber.Handler {
 		return c.Next()
 	}
 }
+
+// RateLimitSignup limits organization signups per IP (5 per hour).
+// Protects against automated account creation and spam while preserving privacy (no IP logging).
+func RateLimitSignup(rl *authRateLimiter) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		ip := c.IP()
+		key := ip + ":signup"
+
+		if !rl.allow(key) {
+			log.Printf("RATELIMIT_SIGNUP blocked")
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+				"error": "Too many requests. Please try again later.",
+			})
+		}
+		return c.Next()
+	}
+}

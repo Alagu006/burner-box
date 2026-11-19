@@ -1,84 +1,85 @@
 # BurnerBox Privacy Policy
 
-**Effective date:** August 17, 2026
+**Effective date:** November 5, 2026
 
-This is a plain-language summary of how BurnerBox handles your data. It is not a legal document — it is written to be understood by anyone.
+This document explains in plain language how BurnerBox handles your data. It describes the system as implemented in code.
 
-## What BurnerBox is
+---
 
-BurnerBox is an anonymous whistleblowing platform. It lets people submit tips to organizations without revealing their identity. It also provides ephemeral, encrypted chat rooms for real-time communication.
+## What BurnerBox Is
 
-## What we do NOT collect
+BurnerBox is an open-source anonymous whistleblowing and secure communication platform. It enables individuals to submit encrypted tips to organizations without revealing their identity, and provides ephemeral end-to-end encrypted chat rooms for real-time collaboration.
 
-- **We do not log your IP address.** The server never reads, stores, or logs your IP address. This applies to all endpoints: submissions, room chat, authentication, and everything else.
-- **We do not use cookies.** No session cookies, no tracking cookies, no advertising cookies. Zero cookies are set by the server.
-- **We do not use analytics or trackers.** No Google Analytics, no Mixpanel, no Hotjar, no Facebook Pixel, no telemetry of any kind.
-- **We do not log your User-Agent.** Your browser type, operating system, and device information are never recorded.
-- **We do not track your browsing behavior.** There are no session histories, no page view logs, no click tracking.
+---
 
-## What we DO store
+## What We Do NOT Collect
 
-### Anonymous submissions (tips)
+- **We do not log your IP address:** The server never records or writes client IP addresses to logs or databases. Rate limiting relies strictly on transient in-memory counters that are never written to disk or logs.
+- **We do not leak your IP via third parties:** All fonts, scripts, and assets are hosted locally on the application server. Our strict Content Security Policy forbids third-party network connections (no Google Fonts, CDNs, or tracking pixels), preventing external entities from logging your IP address when you load the site.
+- **We do not use cookies:** No session cookies, no tracking cookies, and no third-party cookies. Authentication is performed via standard bearer tokens.
+- **We do not use analytics or third-party trackers:** No Google Analytics, telemetry libraries, tracking pixels, or external scripts are loaded.
+- **We do not log your User-Agent:** Your browser type, version, and operating system are never recorded.
+- **We do not track browsing behavior:** No page view tracking, click streams, or session profiling exist.
+- **Transport Security & Onion Routing:** To prevent your IP address from being visible to your local internet provider (ISP) during network transport, BurnerBox supports Tor Onion Services (v3 `.onion`). When accessed via Tor Browser, your traffic is routed across 3 encrypted Tor relays, and the server receives connections from the local Tor daemon (`127.0.0.1`), completely hiding your client IP in transit. Clearnet requests emit an `Onion-Location` header to notify Tor Browser users of the onion service.
 
-When you submit a tip through the web interface:
-- Your message is encrypted in your browser before it is sent. The server receives only ciphertext.
-- You are assigned a random anonymous name (e.g., "calm-harbor"). This is the only identifier linked to your submission.
-- If you choose to enable replies, a decryption key is generated in your browser and stored in your browser's local storage. The server never receives this key.
-- Files you attach are encrypted on the server using a server-held key. **The server can decrypt your files.** Client-side encryption for files is not yet implemented. TODO: implement client-side file encryption before production.
+---
 
-### Ephemeral secure rooms
+## What We DO Store
 
-When you join a chat room:
-- Your messages are encrypted in your browser using a shared key that never leaves your device.
-- You are assigned a random anonymous name for the duration of the session.
-- The server stores only encrypted messages. It cannot read your messages.
-- Messages can be set to self-destruct after 10 seconds, 1 minute, 5 minutes, or 10 minutes.
-- The room itself expires after a time you choose (1 hour to 7 days). When it expires, the room and all its messages are permanently deleted from the database. There is no recovery mechanism.
-- The encryption key is embedded in the URL after the `#` symbol. The part of the URL after `#` is never sent to the server, but it may appear in browser history.
+### 1. Anonymous Submissions (Tips)
+- **Encrypted Message Content:** When submitting a tip to an organization with encryption enabled, your message is encrypted in your browser using either libsodium or OpenPGP. The server rejects plaintext submissions and stores only ciphertext and encryption metadata.
+- **Random Pseudonym:** You are assigned a randomly generated pseudonym (e.g. `Velvet Raven-ETYH`). This is the sole identifier associated with your submission.
+- **Reply Keys:** If you enable replies, an encryption keypair is generated locally in your browser. The private key is encrypted with a passphrase before being stored in your browser's local storage. The server stores only your reply public key.
+- **File Attachments:** Files are encrypted client-side in your browser before upload. On the server, file magic bytes are checked, image EXIF/metadata is stripped (failing closed if stripping cannot complete), and files are stored encrypted on disk with AES-256-GCM.
+- **Cryptographic Receipts:** Legitimate submissions receive a signed Ed25519 cryptographic receipt and Merkle log inclusion proof verifying acceptance. Submissions caught by honeypots or timing checks are discarded without signed receipts.
 
-### Organization accounts
+### 2. Ephemeral Secure Rooms
+- **End-to-End Encryption:** Messages are encrypted in your browser using a symmetric key embedded solely in the URL fragment (`#key=...`). The server stores and relays only ciphertext.
+- **Self-Destruct Messages:** Messages set with self-destruct timers (10 seconds to 10 minutes) are permanently wiped from the database once their timer expires.
+- **Room Expiration:** Rooms expire between 1 hour and 7 days. Once expired, a background worker hard-deletes the room and all messages in an unrecoverable database transaction.
 
-Organizations that sign up for a dashboard:
-- We store the organization name, email address, and a hashed password (Argon2id).
-- We store the organization's encryption public key and (if enabled) an encrypted TOTP secret.
-- Dashboard activity (viewing submissions, sending replies) is not logged beyond a minimal HTTP request log that shows only the method, path, and status code (e.g., "POST /api/v1/dashboard/submissions - 200"). No IP addresses, no user identifiers.
+### 3. Organization Accounts
+- **Account Credentials:** We store the organization name, contact email, and an Argon2id-hashed password.
+- **Encryption Configuration:** Organizations store their encryption public key and, if 2FA is enabled, an AES-256-GCM encrypted TOTP secret.
+- **Stateful Sessions:** Active login sessions are tracked in the database to allow organizations to view active sessions, revoke specific devices, or revoke all other sessions. IP addresses are never recorded in session records.
+- **Account Deletion:** Administrators can permanently hard-delete their organization via `DELETE /api/v1/dashboard/account` (requiring password and 2FA TOTP verification). Deletion completely wipes the organization, submissions, attached files on disk, replies, notes, thread messages, Merkle tree records, sessions, team members, and settings.
 
-## How long data is kept
+---
 
-| What | How long |
-|------|----------|
-| Chat room messages | Until the room expires or the message self-destructs. Maximum 7 days. |
-| Chat rooms | 1 hour to 7 days, depending on what the room creator chose. Hard-deleted when expired. |
-| Anonymous tips (submissions) | Indefinitely, until the organization deletes them. There is no automatic expiration. TODO: add configurable retention periods. |
-| Tip attachments (files) | Same as the tip they are attached to. Indefinite. |
-| Organization accounts | Indefinitely. No account deletion is implemented yet. TODO: add account deletion. |
+## Data Retention & Automatic Expiration
 
-## What happens when data is deleted
+| Data Category | Retention Period | Deletion Mechanism |
+|---------------|------------------|---------------------|
+| Room messages | 10 seconds to 7 days | Hard-deleted upon self-destruct or room expiration |
+| Chat rooms | 1 hour to 7 days | Hard-deleted by background worker every 60 seconds |
+| Anonymous tips (submissions) | **Configurable: 1 to 3650 days** | Hard-deleted along with attached files and replies by hourly cleanup worker |
+| Submission files | Same as associated tip | Removed from storage disk (`os.Remove`) upon tip expiration |
+| Organization accounts | User-controlled (permanent deletion on-demand) | Hard-deleted on-demand via `DELETE /api/v1/dashboard/account` (admin password + TOTP confirmation); permanently wipes organization, submissions, disk files, replies, threads, Merkle logs, sessions, and team memberships |
 
-When a chat room expires, the server runs a database transaction that deletes all messages in that room and then deletes the room itself. This is a hard delete — the data is removed from the database and cannot be recovered.
+---
 
-When a tip is deleted by an organization, the associated files are removed from disk and the database records are removed.
+## Your Encryption Keys
 
-## Your encryption keys
+- **Organization Private Keys:** Generated in the browser upon signup. The private key is encrypted at rest with a password-derived key (Argon2id + secretbox) or OpenPGP passphrase before being saved to browser `localStorage`.
+- **Submitter Reply Keys:** Stored in browser `localStorage` encrypted at rest with a passphrase.
+- **Room Keys:** Generated locally in the browser, embedded in the URL fragment, and never transmitted to the server.
 
-- **Organization keys:** Generated when an organization signs up. The private key is stored in your browser's local storage. The server only has the public key. If you lose the private key, encrypted submissions cannot be decrypted.
-- **Reply keys:** Generated when you submit a tip and enable replies. The private key is stored in your browser's local storage. The server only has the public key.
-- **Room keys:** Generated in your browser when you create a room. Embedded in the share link URL. Never sent to the server.
+The server never has access to unencrypted private keys. If you lose your password or passphrase, encrypted content cannot be decrypted by anyone, including the server operators.
 
-**Important:** Your private keys are stored in plain text in your browser's local storage. If your browser is compromised (malicious extension, XSS attack, physical access to your device), an attacker could extract these keys. TODO: encrypt private keys with a user-derived password before storing them.
+---
 
-## Open source
+## Unresolved Items Requiring Human Input
 
-BurnerBox is open source. You can audit the code yourself to verify the claims in this policy. The source code repository is the authoritative reference for how the system works.
+> [!IMPORTANT]
+> **TODO (Requires Human Input) — Privacy & Security Contact:**
+> Add an official privacy and security contact email address or encrypted communication channel before production deployment.
 
-## Changes to this policy
+> [!IMPORTANT]
+> **TODO (Requires Human Input) — Jurisdiction-Specific Legal Review:**
+> Review regulatory requirements for production deployments in specific legal jurisdictions (including GDPR, CCPA, and regional whistleblower regulations), establishing formal data controller designations and data subject rights procedures.
 
-If this policy changes, the updated version will be committed to the repository with a new effective date. There is no notification mechanism for policy changes — check the repository for the latest version.
+---
 
-## Contact
+## Open Source Verification
 
-TODO: Add a privacy contact email or encrypted communication channel before production deployment.
-
-## Jurisdiction-specific notes
-
-**TODO:** This privacy policy is written for general applicability. Before deploying in production, review whether specific jurisdictions require additional disclosures (e.g., GDPR requires a named data controller, specific legal bases for processing, and data subject rights). The current policy does not address GDPR compliance, CCPA compliance, or other jurisdiction-specific privacy regulations.
+BurnerBox is open source. You can audit the codebase directly to verify that all cryptographic and privacy assurances described here match the running application.

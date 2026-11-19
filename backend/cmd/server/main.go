@@ -31,6 +31,9 @@ func main() {
 	// Start background cleanup for expired ephemeral rooms
 	go handlers.CleanupExpiredRooms()
 
+	// Start background room lifecycle workers (tombstone janitor & reconciler)
+	handlers.StartRoomLifecycleWorkers()
+
 	// Start background retention cleanup for submissions (hourly)
 	go handlers.CleanupRetainedSubmissions()
 
@@ -57,8 +60,21 @@ func main() {
 	}
 
 	app.Use(helmet.New(helmet.Config{
+		XSSProtection:         "1; mode=block",
+		ContentTypeNosniff:    "nosniff",
+		XFrameOptions:         "DENY",
+		ReferrerPolicy:        "no-referrer",
 		ContentSecurityPolicy: "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' " + cspWS + "; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
 	}))
+
+	// Tor Onion-Location header: when configured, instructs Tor Browser to switch
+	// to the onion hidden service for complete end-to-end transport IP concealment.
+	if onionLocation := os.Getenv("ONION_LOCATION"); onionLocation != "" {
+		app.Use(func(c *fiber.Ctx) error {
+			c.Set("Onion-Location", onionLocation)
+			return c.Next()
+		})
+	}
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: cfg.CORSOrigins,
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
@@ -100,8 +116,10 @@ func main() {
 	// Warrant canary (public, read-only)
 	api.Get("/canary", handlers.GetCanary)
 
-	// Proof of submission public key (for independent verification)
+	// Proof of submission public key & registry (for independent verification)
 	api.Get("/proof-key", handlers.GetProofPublicKey)
+	api.Get("/proof-keys", handlers.GetAllProofKeys)
+	api.Get("/proof-keys/:id", handlers.GetProofKeyByIdentifier)
 
 	// Public platform statistics (unauthenticated, hourly-cached)
 	api.Get("/stats", handlers.GetPublicStats)
@@ -111,12 +129,14 @@ func main() {
 
 	// Auth routes
 	auth := api.Group("/auth")
-	auth.Post("/signup", handlers.SignupOrganization)
+	signupLimiter := middleware.NewAuthRateLimiter(5, time.Hour)
+	auth.Post("/signup", middleware.RateLimitSignup(signupLimiter), handlers.SignupOrganization)
 
 	// Auth rate limiter: 5 attempts per 15 minutes per IP+email
 	authLimiter := middleware.NewAuthRateLimiter(5, 15*time.Minute)
 	auth.Post("/login", middleware.RateLimitLogin(authLimiter), handlers.LoginOrganization)
 	auth.Post("/login/2fa", middleware.RateLimit2FA(authLimiter), handlers.Login2FA)
+	auth.Post("/logout", middleware.Protected(), handlers.LogoutOrganization)
 
 	// Organization public profile
 	org := api.Group("/org")
@@ -135,17 +155,20 @@ func main() {
 	app.Use("/api/v1/rooms/:code/ws", websocket.New(handlers.JoinRoom))
 	app.Use("/api/v1/submit/:slug/status/:anonymous_name/ws", websocket.New(handlers.JoinStatusStream))
 
-	// Anonymous submission routes
+	// Anonymous submission & portal verification routes
 	submit := api.Group("/submit")
+	submit.Get("/:slug/public-key", handlers.GetOrganizationPublicKey)
 	submit.Post("/:slug", handlers.SubmitAnonymousTip)
+	submit.Get("/:slug/merkle-roots", handlers.GetPortalMerkleRoots)
+	submit.Get("/:slug/proof/:id", handlers.GetSubmissionInclusionProof)
+	submit.Get("/inclusion-proof", handlers.GetSubmissionInclusionProof)
 
-	// Replies lookup: rate-limited (30/min/IP) to prevent anonymous name enumeration
+	// Portal public routes alias
+	portal := api.Group("/portal")
+	portal.Get("/:slug/merkle-roots", handlers.GetPortalMerkleRoots)
+
+	// Replies lookup: rate-limited (30/15min/IP) to prevent anonymous name enumeration
 	repliesLimiter := middleware.NewAuthRateLimiter(30, 15*time.Minute)
-	submit.Get("/replies", middleware.RateLimitReplies(repliesLimiter), handlers.CheckForReplies)
-
-	// Public submission routes (NO AUTH REQUIRED)
-	submit.Get("/:slug/public-key", handlers.GetOrganizationPublicKey) // NEW
-	submit.Post("/:slug", handlers.SubmitAnonymousTip)
 	submit.Get("/replies", middleware.RateLimitReplies(repliesLimiter), handlers.CheckForReplies)
 
 	// ==========================================
@@ -169,6 +192,12 @@ func main() {
 		})
 	})
 
+	// Session management routes (all authenticated roles can manage their sessions)
+	sessions := protected.Group("/sessions")
+	sessions.Get("/", handlers.ListActiveSessions)
+	sessions.Delete("/:id", handlers.RevokeSession)
+	sessions.Delete("/", handlers.RevokeAllOtherSessions)
+
 	// 2FA routes (all roles)
 	twofa := protected.Group("/2fa")
 	twofa.Post("/setup", handlers.Setup2FA)
@@ -177,69 +206,76 @@ func main() {
 	twofa.Get("/status", handlers.Check2FAStatus)
 
 	// === ADMIN ONLY ===
-	admin := protected.Group("", middleware.RequireRole("admin"))
+	adminRole := middleware.RequireRole("admin")
 
 	// Key rotation
-	admin.Put("/public-key", handlers.RotatePublicKey)
+	protected.Put("/public-key", adminRole, handlers.RotatePublicKey)
+
+	// Public portal customization & settings
+	protected.Get("/customization", adminRole, handlers.GetCustomizationSettings)
+	protected.Put("/customization", adminRole, handlers.UpdateCustomizationSettings)
 
 	// Submission portal settings (deadline)
-	admin.Get("/submission-settings", handlers.GetSubmissionSettings)
-	admin.Put("/submission-settings", handlers.UpdateSubmissionSettings)
+	protected.Get("/submission-settings", adminRole, handlers.GetSubmissionSettings)
+	protected.Put("/submission-settings", adminRole, handlers.UpdateSubmissionSettings)
 
 	// Dead man's switch
-	admin.Get("/dead-mans-switch", handlers.GetDeadMansSwitch)
-	admin.Put("/dead-mans-switch", handlers.UpdateDeadMansSwitch)
+	protected.Get("/dead-mans-switch", adminRole, handlers.GetDeadMansSwitch)
+	protected.Put("/dead-mans-switch", adminRole, handlers.UpdateDeadMansSwitch)
 
 	// Retention policy settings
-	admin.Get("/retention", handlers.GetRetentionSettings)
-	admin.Put("/retention", handlers.UpdateRetentionSettings)
+	protected.Get("/retention", adminRole, handlers.GetRetentionSettings)
+	protected.Put("/retention", adminRole, handlers.UpdateRetentionSettings)
 
 	// Notification settings (webhook + email)
-	admin.Get("/notifications", handlers.GetNotificationSettings)
-	admin.Put("/notifications", handlers.UpdateNotificationSettings)
+	protected.Get("/notifications", adminRole, handlers.GetNotificationSettings)
+	protected.Put("/notifications", adminRole, handlers.UpdateNotificationSettings)
 
 	// Team routes
-	team := admin.Group("/team")
+	team := protected.Group("/team", adminRole)
 	team.Post("/invite", handlers.InviteTeamMember)
 	team.Get("/", handlers.ListTeamMembers)
 	team.Delete("/:id", handlers.RemoveTeamMember)
 
-	// === RESPONDER+ (responder or admin) ===
-	responder := protected.Group("", middleware.RequireRole("responder"))
+	// Account deletion (admin only, requires password + 2FA verification)
+	protected.Delete("/account", adminRole, handlers.DeleteAccount)
 
-	// Submission management routes
-	submissions := responder.Group("/submissions")
+	// === RESPONDER+ (responder or admin) ===
+	responderRole := middleware.RequireRole("responder")
+
+	// Submission management routes (GET operations allowed for all authenticated roles including reader)
+	submissions := protected.Group("/submissions")
 	submissions.Get("/", handlers.GetOrganizationSubmissions)
 	submissions.Get("/:id", handlers.GetSubmission)
-	submissions.Put("/:id", handlers.UpdateSubmissionStatus)
-	submissions.Put("/:id/assign", handlers.AssignSubmission)
-	submissions.Post("/:id/reply", handlers.ReplyToSubmission)
+	submissions.Put("/:id", responderRole, handlers.UpdateSubmissionStatus)
+	submissions.Put("/:id/assign", responderRole, handlers.AssignSubmission)
+	submissions.Post("/:id/reply", responderRole, handlers.ReplyToSubmission)
 
 	// File routes for submissions
-	submissions.Post("/:id/files", handlers.UploadSubmissionFile)
+	submissions.Post("/:id/files", responderRole, handlers.UploadSubmissionFile)
 	submissions.Get("/:id/files", handlers.GetSubmissionFiles)
 	submissions.Get("/:id/files/:fileId", handlers.DownloadSubmissionFile)
 
-	submissions.Post("/:id/notes", handlers.AddInternalNote)
+	submissions.Post("/:id/notes", responderRole, handlers.AddInternalNote)
 	submissions.Get("/:id/notes", handlers.GetInternalNotes)
 	submissions.Get("/:id/activity", handlers.GetSubmissionActivity)
 
-	// Thread messages (responder+)
+	// Thread messages
 	submissions.Get("/:id/messages", handlers.GetThreadMessages)
-	submissions.Post("/:id/messages", handlers.AddThreadMessageFromOrg)
+	submissions.Post("/:id/messages", responderRole, handlers.AddThreadMessageFromOrg)
 
 	// Bulk actions
-	submissions.Post("/bulk/status", handlers.BulkUpdateStatus)
-	submissions.Post("/bulk/assign", handlers.BulkAssign)
+	submissions.Post("/bulk/status", responderRole, handlers.BulkUpdateStatus)
+	submissions.Post("/bulk/assign", responderRole, handlers.BulkAssign)
 
 	// Export
-	submissions.Post("/export", handlers.ExportSubmissions)
+	submissions.Post("/export", responderRole, handlers.ExportSubmissions)
 
 	// Public thread routes (submitter follow-ups, no auth)
 	thread := api.Group("/thread")
 	thread.Get("/", handlers.GetThreadFromSubmitter)
 	thread.Post("/", handlers.AddThreadMessageFromSubmitter)
-	
+
 	// ==========================================
 	// 404 CATCH-ALL (Must be last)
 	// ==========================================
@@ -281,6 +317,9 @@ func main() {
 			handlers.CheckDeadManSwitches()
 		}
 	}()
+
+	// Background: seal open Merkle batches hourly
+	go handlers.StartMerkleBatchSealer(1 * time.Hour)
 
 	log.Printf("🚀 BurnerBox running on http://localhost:%s", port)
 	log.Printf("📋 Health: http://localhost:%s/api/health", port)

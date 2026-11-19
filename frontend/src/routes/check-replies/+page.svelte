@@ -1,8 +1,10 @@
 <script>
-  import { decryptFromSender, encryptForRecipient } from '$lib/crypto';
+  import { decryptFromSender, encryptForRecipient, decryptPrivateKey } from '$lib/crypto';
   import { API_URL, WS_URL } from '$lib/api';
 
   let anonymousName = $state('');
+  let passphrase = $state('');
+  let unlockedPrivateKey = $state('');
   let timeline = $state([]);
   let loading = $state(false);
   let error = $state('');
@@ -25,6 +27,66 @@
   let pollingTimer = $state(null);
   let slug = $state('');
   let lastPollTime = $state('');
+  let merkleProofData = $state(null);
+
+  function downloadSealedReceipt() {
+    if (!merkleProofData) return;
+    const receiptObj = {
+      version: '2.0',
+      receipt_type: 'BurnerBox Sealed Cryptographic Inclusion Receipt',
+      submission_id: merkleProofData.submission_id,
+      anonymous_name: anonymousName,
+      status: merkleProofData.status,
+      leaf_index: merkleProofData.leaf_index,
+      leaf_hash: merkleProofData.leaf_hash,
+      batch_id: merkleProofData.batch_id,
+      batch_number: merkleProofData.batch_number,
+      root_hash: merkleProofData.root_hash,
+      root_signature: merkleProofData.root_signature,
+      key_fingerprint: merkleProofData.key_fingerprint,
+      server_public_key: merkleProofData.server_public_key,
+      sealed_at: merkleProofData.sealed_at,
+      inclusion_proof: merkleProofData.inclusion_proof || [],
+      verification_guide: {
+        offline_tool: 'verify-receipt.html',
+        instructions: 'Open verify-receipt.html in any browser (offline or online) and paste or load this file to independently recompute and verify your Merkle inclusion path against the server signed root.',
+      },
+    };
+
+    const blob = new Blob([JSON.stringify(receiptObj, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `burnerbox-sealed-receipt-${merkleProofData.submission_id}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function unlockStoredPrivateKey(enteredPassphrase) {
+    const rawStoredKey = localStorage.getItem('burnerbox_reply_private_key');
+    if (!rawStoredKey) {
+      return { key: null, error: 'No decryption key stored in this browser. Please use the same device & browser used when submitting.' };
+    }
+
+    try {
+      const parsed = JSON.parse(rawStoredKey);
+      if (parsed.encrypted && parsed.salt && parsed.nonce) {
+        if (!enteredPassphrase.trim()) {
+          return { key: null, error: 'Please enter your passphrase to unlock replies.' };
+        }
+        try {
+          const decryptedKey = await decryptPrivateKey(parsed.encrypted, parsed.salt, parsed.nonce, enteredPassphrase.trim());
+          return { key: decryptedKey, error: null };
+        } catch {
+          return { key: null, error: 'Invalid passphrase. Could not unlock reply decryption key.' };
+        }
+      }
+    } catch {
+      // Legacy unencrypted key format
+      return { key: rawStoredKey, error: null };
+    }
+    return { key: rawStoredKey, error: null };
+  }
 
   async function checkReplies(e) {
     e.preventDefault();
@@ -39,6 +101,15 @@
       loading = false;
       return;
     }
+
+    // Attempt to unlock private key if stored
+    const unlockResult = await unlockStoredPrivateKey(passphrase);
+    if (unlockResult.error && localStorage.getItem('burnerbox_reply_private_key')) {
+      error = unlockResult.error;
+      loading = false;
+      return;
+    }
+    unlockedPrivateKey = unlockResult.key || '';
 
     try {
       // Fetch thread timeline (includes legacy replies + new thread messages)
@@ -89,6 +160,16 @@
       success = true;
       connectStatusWs();
 
+      // Fetch Merkle inclusion proof if available
+      try {
+        const proofResp = await fetch(`${API_URL}/api/v1/submit/inclusion-proof?submission_id=${encodeURIComponent(submissionId)}`);
+        if (proofResp.ok) {
+          merkleProofData = await proofResp.json();
+        }
+      } catch {
+        merkleProofData = null;
+      }
+
     } catch (err) {
       error = 'Network error. Cannot reach server.';
     }
@@ -97,11 +178,10 @@
   }
 
   async function decryptTimeline(entries) {
-    const privateKey = localStorage.getItem('burnerbox_reply_private_key');
-    if (!privateKey) {
+    if (!unlockedPrivateKey) {
       entries.forEach((entry, i) => {
         if (entry.encrypted_text) {
-          decryptionErrors[i] = 'No decryption key in this browser. Use the same browser where you submitted.';
+          decryptionErrors[i] = 'No unlocked decryption key. Please enter your passphrase to decrypt.';
         }
       });
       return;
@@ -123,7 +203,7 @@
             boxNonce: meta.boxNonce,
             senderPublicKey: meta.senderPublicKey,
           },
-          privateKey
+          unlockedPrivateKey
         );
         entry._decryptedText = decrypted;
       } catch {
@@ -336,15 +416,92 @@
           <p class="text-emerald-400 font-medium">✅ Found your submission!</p>
         </div>
 
-        <div class="flex items-center gap-2 mb-4 text-sm">
-          <span class="text-slate-400">Status:</span>
-          <span class="text-white font-medium">{statusLabel(submissionStatus)}</span>
-          {#if statusConnected}
-            <span class="text-emerald-400 text-xs">● Live</span>
+        <div class="flex items-center justify-between bg-slate-700/50 rounded-lg p-3 mb-4">
+          <div class="flex items-center gap-2 text-sm">
+            <span class="text-slate-400">Status:</span>
+            <span class="text-white font-medium">{statusLabel(submissionStatus)}</span>
+            {#if statusConnected}
+              <span class="text-emerald-400 text-xs">● Live</span>
+            {:else}
+              <span class="text-slate-500 text-xs">● Polling{lastPollTime ? ` (${lastPollTime})` : ''}</span>
+            {/if}
+          </div>
+          {#if unlockedPrivateKey}
+            <span class="bg-emerald-900/60 text-emerald-300 text-xs px-2.5 py-1 rounded-full border border-emerald-500/40">
+              🔓 Reply Key Unlocked
+            </span>
           {:else}
-            <span class="text-slate-500 text-xs">● Polling{lastPollTime ? ` (${lastPollTime})` : ''}</span>
+            <span class="bg-amber-900/60 text-amber-300 text-xs px-2.5 py-1 rounded-full border border-amber-500/40">
+              🔒 Locked (No Key)
+            </span>
           {/if}
         </div>
+
+        <!-- Merkle Tree Inclusion Proof Status Card -->
+        {#if merkleProofData}
+          <div class="bg-slate-800 border border-slate-700 rounded-xl p-4 mb-4 space-y-2.5">
+            <div class="flex items-center justify-between">
+              <h3 class="text-xs font-semibold text-white uppercase tracking-wider flex items-center gap-1.5">
+                <span>🌳 Cryptographic Batch Log (Merkle Tree)</span>
+              </h3>
+              {#if merkleProofData.status === 'sealed'}
+                <span class="bg-emerald-950/80 border border-emerald-700 text-emerald-400 text-[10px] px-2 py-0.5 rounded font-mono font-medium">
+                  ✅ Sealed & Signed
+                </span>
+              {:else}
+                <span class="bg-amber-950/80 border border-amber-700 text-amber-300 text-[10px] px-2 py-0.5 rounded font-mono font-medium">
+                  ⏳ Queued (Batch #{merkleProofData.batch_number || 1})
+                </span>
+              {/if}
+            </div>
+
+            {#if merkleProofData.status === 'sealed'}
+              <p class="text-xs text-slate-300">
+                Your submission is permanently sealed in Batch #{merkleProofData.batch_number}. The server has published the Ed25519-signed Merkle root.
+              </p>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs bg-slate-900/90 p-3 rounded-lg border border-slate-700/80 font-mono">
+                <div>
+                  <span class="text-slate-500 block text-[10px]">SEALED ROOT HASH</span>
+                  <span class="text-emerald-400 truncate block">{merkleProofData.root_hash?.substring(0, 24)}...</span>
+                </div>
+                <div>
+                  <span class="text-slate-500 block text-[10px]">LEAF INDEX IN TREE</span>
+                  <span class="text-slate-300">Leaf #{merkleProofData.leaf_index} of {merkleProofData.total_leaves}</span>
+                </div>
+                <div>
+                  <span class="text-slate-500 block text-[10px]">KEY FINGERPRINT</span>
+                  <span class="text-slate-300">{merkleProofData.key_fingerprint}</span>
+                </div>
+                <div>
+                  <span class="text-slate-500 block text-[10px]">INCLUSION PATH</span>
+                  <span class="text-blue-400">{merkleProofData.inclusion_proof?.length || 0} sibling step(s)</span>
+                </div>
+              </div>
+
+              <div class="pt-1 flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onclick={downloadSealedReceipt}
+                  class="bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold px-3.5 py-1.5 rounded-lg transition cursor-pointer flex items-center gap-1.5 shadow"
+                >
+                  <span>📥</span> Download Sealed Merkle Receipt (.json)
+                </button>
+                <a
+                  href="/verify-receipt.html"
+                  target="_blank"
+                  rel="noreferrer"
+                  class="text-xs text-slate-400 hover:text-emerald-400 underline"
+                >
+                  Verify in Offline Tool ↗
+                </a>
+              </div>
+            {:else}
+              <p class="text-xs text-slate-400">
+                Your submission is currently in open Batch #{merkleProofData.batch_number} (Leaf #{merkleProofData.leaf_index}). When the hourly sealer runs, your full cryptographic inclusion proof and signed root will be available here.
+              </p>
+            {/if}
+          </div>
+        {/if}
 
         <!-- Thread Timeline -->
         <div class="space-y-3 mb-6">
@@ -412,6 +569,8 @@
             success = false;
             timeline = [];
             anonymousName = '';
+            passphrase = '';
+            unlockedPrivateKey = '';
             error = '';
             decryptionErrors = {};
             submissionStatus = '';
@@ -426,7 +585,7 @@
 
       {:else}
         <form onsubmit={checkReplies}>
-          <div class="mb-6">
+          <div class="mb-4">
             <label for="name" class="block text-sm font-medium text-slate-300 mb-2">
               Your Anonymous Identity
             </label>
@@ -435,11 +594,27 @@
               type="text"
               bind:value={anonymousName}
               required
-              class="w-full px-4 py-3 bg-slate-700 border border-slate-600 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-emerald-500"
+              class="w-full px-4 py-3 bg-slate-700 border border-slate-600 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-emerald-500 font-mono"
               placeholder="e.g., Purple Falcon-A1B2"
             />
             <p class="text-slate-500 text-xs mt-2">
               This was shown to you when you submitted your tip.
+            </p>
+          </div>
+
+          <div class="mb-6">
+            <label for="passphrase" class="block text-sm font-medium text-slate-300 mb-2">
+              Decryption Passphrase
+            </label>
+            <input
+              id="passphrase"
+              type="text"
+              bind:value={passphrase}
+              class="w-full px-4 py-3 bg-slate-700 border border-slate-600 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-emerald-500 font-mono"
+              placeholder="e.g., coral-haven-flame-1234"
+            />
+            <p class="text-slate-500 text-xs mt-2">
+              The secret passphrase shown when you enabled replies during submission.
             </p>
           </div>
 
@@ -448,7 +623,7 @@
             disabled={loading}
             class="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-600 text-white py-3 rounded-lg font-medium transition cursor-pointer"
           >
-            {loading ? 'Checking...' : '🔍 Check for Replies'}
+            {loading ? 'Unlocking & Checking...' : '🔍 Unlock & Check for Replies'}
           </button>
         </form>
       {/if}

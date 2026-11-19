@@ -40,6 +40,41 @@
   let fileInput = $state(null);
   let uploading = $state(false);
 
+  // Room creator capability state
+  let isCreator = $state(false);
+  let burningRoom = $state(false);
+
+  async function handleBurnRoom() {
+    if (!confirm('Are you sure you want to permanently destroy this room and all its messages? This action cannot be undone.')) {
+      return;
+    }
+    const token = sessionStorage.getItem('bb_creator_token_' + roomCode);
+    if (!token) {
+      alert('Creator token not found in this browser tab.');
+      return;
+    }
+    burningRoom = true;
+    try {
+      const resp = await fetch(`${API_URL}/api/v1/rooms/${roomCode}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+      if (resp.ok) {
+        sessionStorage.removeItem('bb_creator_token_' + roomCode);
+        window.location.replace('/');
+      } else {
+        const d = await resp.json().catch(() => ({}));
+        alert(d.error || 'Failed to destroy room');
+      }
+    } catch (err) {
+      alert('Network error while attempting to destroy room');
+    } finally {
+      burningRoom = false;
+    }
+  }
+
   const burnOptions = [
     { value: 0, label: 'No burn' },
     { value: 10, label: '10 seconds' },
@@ -96,6 +131,13 @@
 
     displayName = generateDisplayName();
     window.addEventListener('keydown', handleKeyDown);
+
+    try {
+      const token = sessionStorage.getItem('bb_creator_token_' + roomCode);
+      if (token) {
+        isCreator = true;
+      }
+    } catch (e) {}
   });
 
   onDestroy(() => {
@@ -142,6 +184,15 @@
     ws.onmessage = async (event) => {
       try {
         const msg = JSON.parse(event.data);
+
+        if (msg.type === 'room_destroyed') {
+          try {
+            sessionStorage.removeItem('bb_creator_token_' + roomCode);
+          } catch (e) {}
+          alert('This room has been destroyed.');
+          window.location.replace('/');
+          return;
+        }
 
         if (msg.type === 'error') {
           if (msg.payload === 'Password required') {
@@ -657,6 +708,16 @@
         </div>
       </div>
       <div class="flex items-center gap-2">
+        {#if isCreator}
+          <button
+            onclick={handleBurnRoom}
+            disabled={burningRoom}
+            class="bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-700/80 px-3 py-1.5 rounded font-bold text-xs transition cursor-pointer"
+            title="Burn Room (Permanently Delete)"
+          >
+            {burningRoom ? 'Burning...' : '🔥 Burn Room'}
+          </button>
+        {/if}
         <button
           onclick={handleQuickExit}
           class="bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded font-bold text-xs transition cursor-pointer"

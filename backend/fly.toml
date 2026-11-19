@@ -42,12 +42,15 @@ primary_region = "iad"
 
 # ---- Secrets (set via `fly secrets set`, never committed) ----
 # Required secrets:
-#   DATABASE_URL          — PostgreSQL connection string
-#   JWT_SECRET            — HMAC signing key for JWTs (generate with: openssl rand -base64 64)
-#   TOTP_ENCRYPTION_KEY   — AES-256 key, base64-encoded (generate with: openssl rand -base64 32)
-#   FILE_ENCRYPTION_KEY   — AES-256 key, base64-encoded (generate with: openssl rand -base64 32)
+#   DATABASE_URL               — PostgreSQL connection string
+#   JWT_SECRET                 — HMAC signing key for JWTs (generate with: openssl rand -base64 64)
+#   TOTP_ENCRYPTION_KEY        — AES-256 key, base64-encoded (generate with: openssl rand -base64 32)
+#   FILE_ENCRYPTION_KEY        — AES-256 key, base64-encoded (generate with: openssl rand -base64 32)
+#   PROOF_SIGNING_PRIVATE_KEY  — Ed25519 32-byte seed or 64-byte private key, base64-encoded
 #
 # Optional secrets:
-#   CORS_ORIGINS          — Comma-separated allowed origins (e.g. "https://burnerbox.example.com")
-#   API_URL               — Public URL of this API (e.g. "https://api.burnerbox.example.com")
-#   SUBMISSION_URL_PREFIX — Full URL prefix for submission links
+#   PROOF_SIGNING_KEY_ID       — Identifier for active signing key (e.g. "bb-prod-2026-v1")
+#   PROOF_HISTORICAL_PUBLIC_KEYS — JSON string array of retired verification keys
+#   CORS_ORIGINS               — Comma-separated allowed origins (e.g. "https://burnerbox.example.com")
+#   API_URL                    — Public URL of this API (e.g. "https://api.burnerbox.example.com")
+#   SUBMISSION_URL_PREFIX      — Full URL prefix for submission links

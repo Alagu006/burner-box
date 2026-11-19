@@ -1,6 +1,14 @@
 <script>
-  import { decryptFromSender, encryptForRecipient, decryptFile, getStoredPrivateKey } from '$lib/crypto';
+  import {
+    decryptFromSender,
+    encryptForRecipient,
+    decryptFile,
+    getStoredPrivateKey,
+    decryptFileWithPGP,
+    getTransientPGPPrivateKey,
+  } from '$lib/crypto';
   import { API_URL } from '$lib/api';
+  import { logout } from '$lib/auth';
 
   let token = $state('');
   let submissions = $state([]);
@@ -29,7 +37,7 @@
       loadTeamMembers();
       loadRole();
     } else {
-      window.location.href = '/login';
+      logout('', '/login');
     }
   });
 
@@ -78,9 +86,7 @@
       });
 
       if (response.status === 401) {
-        localStorage.removeItem('burnerbox_token');
-        localStorage.removeItem('burnerbox_org');
-        window.location.href = '/login';
+        await logout(token);
         return;
       }
 
@@ -325,17 +331,30 @@
       const clientMeta = response.headers.get('X-Client-Encryption-Meta');
       if (clientMeta) {
         try {
-          const privateKey = await getStoredPrivateKey();
-          if (!privateKey) {
-            alert('Cannot decrypt file: private key not found. Please login with your password.');
-            return;
-          }
-          const ciphertext = await response.arrayBuffer();
           const metaMap = JSON.parse(clientMeta);
           const fileMeta = metaMap[file.file_name];
+          const ciphertext = await response.arrayBuffer();
+
           if (!fileMeta) {
             blob = new Blob([ciphertext]);
+          } else if (fileMeta.scheme === 'pgp') {
+            const transient = getTransientPGPPrivateKey();
+            if (!transient?.privateKey) {
+              alert('Cannot decrypt file: PGP private key not loaded for this session. Please open the submission detail page to import your PGP key.');
+              return;
+            }
+            const decrypted = await decryptFileWithPGP(
+              new TextDecoder().decode(ciphertext),
+              transient.privateKey,
+              transient.passphrase
+            );
+            blob = new Blob([decrypted]);
           } else {
+            const privateKey = await getStoredPrivateKey();
+            if (!privateKey) {
+              alert('Cannot decrypt file: private key not found. Please login with your password.');
+              return;
+            }
             const decrypted = await decryptFile(
               {
                 ciphertext: new TextDecoder().decode(ciphertext),
@@ -390,15 +409,30 @@
       const clientMeta = response.headers.get('X-Client-Encryption-Meta');
       if (clientMeta) {
         try {
-          const privateKey = await getStoredPrivateKey();
-          if (!privateKey) {
-            alert('Cannot decrypt file for preview: private key not available. Please login with your password.');
-            return;
-          }
-          const ciphertext = await response.arrayBuffer();
           const metaMap = JSON.parse(clientMeta);
           const fileMeta = metaMap[file.file_name];
-          if (fileMeta) {
+          const ciphertext = await response.arrayBuffer();
+
+          if (!fileMeta) {
+            blob = new Blob([ciphertext], { type: file.mime_type });
+          } else if (fileMeta.scheme === 'pgp') {
+            const transient = getTransientPGPPrivateKey();
+            if (!transient?.privateKey) {
+              alert('Cannot decrypt file for preview: PGP private key not loaded in this session.');
+              return;
+            }
+            const decrypted = await decryptFileWithPGP(
+              new TextDecoder().decode(ciphertext),
+              transient.privateKey,
+              transient.passphrase
+            );
+            blob = new Blob([decrypted], { type: file.mime_type });
+          } else {
+            const privateKey = await getStoredPrivateKey();
+            if (!privateKey) {
+              alert('Cannot decrypt file for preview: private key not available. Please login with your password.');
+              return;
+            }
             const decrypted = await decryptFile(
               {
                 ciphertext: new TextDecoder().decode(ciphertext),
@@ -410,8 +444,6 @@
               privateKey
             );
             blob = new Blob([decrypted], { type: file.mime_type });
-          } else {
-            blob = new Blob([ciphertext], { type: file.mime_type });
           }
         } catch {
           blob = await response.blob();

@@ -1,5 +1,6 @@
 <script>
   import { API_URL } from '$lib/api';
+  import { logout } from '$lib/auth';
 
   let token = $state('');
   let members = $state([]);
@@ -11,6 +12,10 @@
 
   $effect(() => {
     token = localStorage.getItem('burnerbox_token') || '';
+    if (!token) {
+      logout('', '/login');
+      return;
+    }
     loadMembers();
   });
 
@@ -24,6 +29,10 @@
     };
     if (body) options.body = JSON.stringify(body);
     const response = await fetch(`${API_URL}/api/v1/dashboard/team${path}`, options);
+    if (response.status === 401) {
+      await logout(token);
+      return {};
+    }
     return response.json();
   }
 

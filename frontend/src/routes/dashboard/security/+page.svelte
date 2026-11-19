@@ -1,6 +1,14 @@
 <script>
   import { API_URL } from '$lib/api';
-  import { generateKeyPair, encryptForRecipient, getStoredPrivateKey, getCachedDerivedKey } from '$lib/crypto';
+  import { logout } from '$lib/auth';
+  import {
+    generateKeyPair,
+    encryptForRecipient,
+    decryptFromSender,
+    getStoredPrivateKey,
+    getCachedDerivedKey,
+    validatePGPPublicKey,
+  } from '$lib/crypto';
 
   let token = $state('');
   let qrCode = $state('');
@@ -12,10 +20,15 @@
   let loading = $state(true);
   let setupMode = $state(false);
 
-  // Key rotation state
+  // Scheme and Key rotation state
+  let orgEncryptionScheme = $state('libsodium'); // 'libsodium' | 'pgp'
+  let targetScheme = $state('libsodium');
+  let newPgpKey = $state('');
+  let pgpValidation = $state(null);
   let rotating = $state(false);
   let rotationProgress = $state('');
   let rotationError = $state('');
+  let rotationSuccessMessage = $state('');
 
   // Dead man's switch state
   let dmsEnabled = $state(false);
@@ -50,9 +63,110 @@
   let notifMessage = $state('');
   let notifError = $state('');
 
+  // User role state
+  let userRole = $state('admin');
+
+  // Account deletion state
+  let deleteModalOpen = $state(false);
+  let deletePassword = $state('');
+  let deleteTotpCode = $state('');
+  let deleteConfirmationText = $state('');
+  let deleteLoading = $state(false);
+  let deleteError = $state('');
+
+  function openDeleteModal() {
+    deletePassword = '';
+    deleteTotpCode = '';
+    deleteConfirmationText = '';
+    deleteError = '';
+    deleteModalOpen = true;
+  }
+
+  function closeDeleteModal() {
+    if (deleteLoading) return;
+    deleteModalOpen = false;
+  }
+
+  async function loadUserRole() {
+    try {
+      const resp = await fetch(`${API_URL}/api/v1/dashboard/`, {
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        userRole = data.role || 'admin';
+      }
+    } catch { /* ignore */ }
+  }
+
+  async function handleDeleteAccount() {
+    if (!deletePassword) {
+      deleteError = 'Password is required to confirm deletion.';
+      return;
+    }
+    if (totpEnabled && !deleteTotpCode.trim()) {
+      deleteError = 'TOTP authentication code is required.';
+      return;
+    }
+    if (deleteConfirmationText.trim().toUpperCase() !== 'DELETE') {
+      deleteError = 'Please type DELETE in all caps to confirm.';
+      return;
+    }
+
+    deleteLoading = true;
+    deleteError = '';
+
+    try {
+      const res = await fetch(`${API_URL}/api/v1/dashboard/account`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          password: deletePassword,
+          code: totpEnabled ? deleteTotpCode.trim() : undefined,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        deleteError = data.error || 'Failed to delete organization account.';
+        deleteLoading = false;
+        return;
+      }
+
+      // Hard-delete succeeded! Clear session and local storage
+      localStorage.removeItem('burnerbox_token');
+      localStorage.removeItem('burnerbox_org');
+      localStorage.removeItem('burnerbox_private_key');
+      localStorage.removeItem('burnerbox_role');
+      // Redirect to login with deleted notification
+      window.location.href = '/login?deleted=true';
+    } catch (err) {
+      deleteError = err.message || 'Network error deleting account.';
+      deleteLoading = false;
+    }
+  }
+
   $effect(() => {
     token = localStorage.getItem('burnerbox_token') || '';
+    if (!token) {
+      logout('', '/login');
+      return;
+    }
+    const orgStored = localStorage.getItem('burnerbox_org');
+    if (orgStored) {
+      try {
+        const parsed = JSON.parse(orgStored);
+        if (parsed.encryption_scheme) {
+          orgEncryptionScheme = parsed.encryption_scheme;
+          targetScheme = parsed.encryption_scheme;
+        }
+      } catch {}
+    }
     check2FAStatus();
+    loadUserRole();
     loadDeadMansSwitch();
     loadDeadline();
     loadRetention();
@@ -70,6 +184,10 @@
     if (body) options.body = JSON.stringify(body);
     
     const response = await fetch(`${API_URL}/api/v1/dashboard/2fa${path}`, options);
+    if (response.status === 401) {
+      await logout(token);
+      return {};
+    }
     return response.json();
   }
 
@@ -132,10 +250,89 @@
     }
   }
 
+  async function handlePGPKeyValidation() {
+    if (!newPgpKey.trim()) {
+      pgpValidation = null;
+      return;
+    }
+    pgpValidation = await validatePGPPublicKey(newPgpKey);
+  }
+
   async function rotateKeys() {
+    rotationError = '';
+    rotationSuccessMessage = '';
+
+    if (targetScheme === 'pgp') {
+      if (!newPgpKey.trim()) {
+        rotationError = 'Please paste an ASCII-armored PGP public key.';
+        return;
+      }
+      const val = await validatePGPPublicKey(newPgpKey);
+      if (!val.valid) {
+        rotationError = 'Invalid PGP public key: ' + val.error;
+        return;
+      }
+
+      const confirmed = confirm(
+        'SWITCH TO PGP WARNING:\n\n' +
+        'This will update your organization to use PGP encryption with your provided public key.\n\n' +
+        'Your PGP private key is NOT stored in BurnerBox. You will need to import it into memory each session to decrypt new tips.\n\n' +
+        'Continue?'
+      );
+      if (!confirmed) return;
+
+      rotating = true;
+      rotationProgress = 'Updating public key and encryption scheme on server...';
+
+      try {
+        const res = await fetch(`${API_URL}/api/v1/dashboard/public-key`, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            public_key: newPgpKey.trim(),
+            encryption_scheme: 'pgp',
+          }),
+        });
+
+        if (!res.ok) {
+          const data = await res.json();
+          rotationError = data.error || 'Failed to update public key on server';
+          rotating = false;
+          return;
+        }
+
+        // PGP private keys are managed outside BurnerBox
+        localStorage.removeItem('burnerbox_private_key');
+        const orgStored = localStorage.getItem('burnerbox_org');
+        if (orgStored) {
+          try {
+            const org = JSON.parse(orgStored);
+            org.encryption_scheme = 'pgp';
+            org.public_key = newPgpKey.trim();
+            localStorage.setItem('burnerbox_org', JSON.stringify(org));
+          } catch {}
+        }
+
+        orgEncryptionScheme = 'pgp';
+        rotationSuccessMessage = 'Successfully switched to PGP encryption scheme!';
+        newPgpKey = '';
+        pgpValidation = null;
+      } catch (err) {
+        rotationError = 'Failed to update: ' + err.message;
+      }
+
+      rotating = false;
+      rotationProgress = '';
+      return;
+    }
+
+    // Libsodium flow
     const confirmed = confirm(
       'KEY ROTATION WARNING:\n\n' +
-      'This will generate a new encryption keypair and re-encrypt all existing ' +
+      'This will generate a new libsodium encryption keypair and re-encrypt all existing ' +
       'submissions. The old key will no longer work.\n\n' +
       'You MUST be logged in with your password to complete this process. ' +
       'Any team members who have cached the old private key will need to ' +
@@ -152,7 +349,7 @@
 
     try {
       const oldPrivateKey = await getStoredPrivateKey();
-      if (!oldPrivateKey) {
+      if (!oldPrivateKey && orgEncryptionScheme === 'libsodium') {
         rotationError = 'Cannot read current private key. Are you logged in with your password?';
         rotating = false;
         return;
@@ -167,7 +364,10 @@
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ public_key: newKeyPair.publicKey }),
+        body: JSON.stringify({
+          public_key: newKeyPair.publicKey,
+          encryption_scheme: 'libsodium',
+        }),
       });
 
       if (!res.ok) {
@@ -186,74 +386,69 @@
         },
       });
 
-      if (!listRes.ok) {
-        rotationError = 'Failed to fetch submissions list';
-        rotating = false;
-        return;
-      }
-
-      const listData = await listRes.json();
-      const subs = listData.submissions || [];
       let reencrypted = 0;
       let skipped = 0;
 
-      for (let i = 0; i < subs.length; i++) {
-        const sub = subs[i];
-        rotationProgress = `Re-encrypting submission ${i + 1}/${subs.length}...`;
+      if (listRes.ok && oldPrivateKey) {
+        const listData = await listRes.json();
+        const subs = listData.submissions || [];
 
-        if (!sub.encrypted_message || !sub.encryption_meta) {
-          skipped++;
-          continue;
-        }
+        for (let i = 0; i < subs.length; i++) {
+          const sub = subs[i];
+          rotationProgress = `Re-encrypting submission ${i + 1}/${subs.length}...`;
 
-        try {
-          const meta = JSON.parse(sub.encryption_meta);
-          const decrypted = await encryptForRecipient(
-            '',
-            newKeyPair.publicKey
-          );
-          // Actually decrypt first, then re-encrypt
-          const { decryptFromSender } = await import('$lib/crypto');
-          const plaintext = await decryptFromSender(
-            {
-              ciphertext: sub.encrypted_message,
-              nonce: meta.nonce,
-              encryptedKey: meta.encryptedKey,
-              boxNonce: meta.boxNonce,
-              senderPublicKey: meta.senderPublicKey,
-            },
-            oldPrivateKey
-          );
+          if (!sub.encrypted_message || !sub.encryption_meta) {
+            skipped++;
+            continue;
+          }
 
-          const reEnc = await encryptForRecipient(plaintext, newKeyPair.publicKey);
-          const newMeta = {
-            nonce: reEnc.nonce,
-            encryptedKey: reEnc.encryptedKey,
-            boxNonce: reEnc.boxNonce,
-            senderPublicKey: reEnc.senderPublicKey,
-          };
+          try {
+            const meta = JSON.parse(sub.encryption_meta);
+            if (meta.scheme === 'pgp') {
+              skipped++;
+              continue;
+            }
 
-          await fetch(`${API_URL}/api/v1/dashboard/submissions/${sub.id}`, {
-            method: 'PUT',
-            headers: {
-              'Authorization': `Bearer ${token}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              encrypted_message: reEnc.ciphertext,
-              encryption_meta: JSON.stringify(newMeta),
-            }),
-          });
+            const plaintext = await decryptFromSender(
+              {
+                ciphertext: sub.encrypted_message,
+                nonce: meta.nonce,
+                encryptedKey: meta.encryptedKey,
+                boxNonce: meta.boxNonce,
+                senderPublicKey: meta.senderPublicKey,
+              },
+              oldPrivateKey
+            );
 
-          reencrypted++;
-        } catch {
-          skipped++;
+            const reEnc = await encryptForRecipient(plaintext, newKeyPair.publicKey);
+            const newMeta = {
+              scheme: 'libsodium',
+              nonce: reEnc.nonce,
+              encryptedKey: reEnc.encryptedKey,
+              boxNonce: reEnc.boxNonce,
+              senderPublicKey: reEnc.senderPublicKey,
+            };
+
+            await fetch(`${API_URL}/api/v1/dashboard/submissions/${sub.id}`, {
+              method: 'PUT',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                encrypted_message: reEnc.ciphertext,
+                encryption_meta: JSON.stringify(newMeta),
+              }),
+            });
+
+            reencrypted++;
+          } catch {
+            skipped++;
+          }
         }
       }
 
       // Store new private key encrypted in localStorage using the cached derived key.
-      // We preserve the ORIGINAL salt from the stored key so that login can still
-      // re-derive the same key from the user's password.
       try {
         const derivedKey = getCachedDerivedKey();
         const storedRaw = localStorage.getItem('burnerbox_private_key');
@@ -281,8 +476,19 @@
         localStorage.setItem('burnerbox_private_key', newKeyPair.privateKey);
       }
 
+      const orgStored = localStorage.getItem('burnerbox_org');
+      if (orgStored) {
+        try {
+          const org = JSON.parse(orgStored);
+          org.encryption_scheme = 'libsodium';
+          org.public_key = newKeyPair.publicKey;
+          localStorage.setItem('burnerbox_org', JSON.stringify(org));
+        } catch {}
+      }
+
+      orgEncryptionScheme = 'libsodium';
       rotationProgress = '';
-      message = `Key rotation complete. ${reencrypted} submission(s) re-encrypted, ${skipped} skipped.`;
+      rotationSuccessMessage = `Key rotation complete. ${reencrypted} submission(s) re-encrypted, ${skipped} skipped.`;
       rotating = false;
 
     } catch (e) {
@@ -595,20 +801,106 @@
         {/if}
       </div>
 
-      <!-- Key Rotation Card -->
+      <!-- Key & Encryption Scheme Management Card -->
       <div class="bg-slate-800 rounded-lg p-6 shadow-xl">
-        <h2 class="text-lg font-semibold text-white mb-4">
-          Encryption Key Rotation
-        </h2>
+        <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+          <h2 class="text-lg font-semibold text-white">
+            🔐 Encryption Scheme & Key Management
+          </h2>
+          {#if orgEncryptionScheme === 'pgp'}
+            <span class="bg-blue-900/60 text-blue-300 border border-blue-500 px-2.5 py-1 rounded text-xs font-semibold">
+              🛡️ Active: PGP (OpenPGP.js)
+            </span>
+          {:else}
+            <span class="bg-emerald-900/60 text-emerald-300 border border-emerald-500 px-2.5 py-1 rounded text-xs font-semibold">
+              ⚡ Active: libsodium (E2EE)
+            </span>
+          {/if}
+        </div>
+
+        <!-- Trade-off Explainer Card -->
+        <div class="bg-slate-900/80 border border-slate-700 rounded-lg p-4 mb-5 text-xs text-slate-300 space-y-2">
+          <p class="font-semibold text-white text-sm mb-1">⚖️ Encryption Scheme Trade-offs:</p>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+            <div class="bg-slate-800/80 p-3 rounded border border-emerald-500/30">
+              <span class="text-emerald-400 font-bold block mb-1">⚡ libsodium (Recommended for most)</span>
+              <p class="text-slate-400 leading-relaxed">
+                <strong>Pros:</strong> Fully automated zero-friction key generation and password-derived local storage encryption.<br/>
+                <strong>Trade-off:</strong> BurnerBox-specific cryptographic envelope.
+              </p>
+            </div>
+            <div class="bg-slate-800/80 p-3 rounded border border-blue-500/30">
+              <span class="text-blue-400 font-bold block mb-1">🛡️ PGP / GPG (Air-gapped & Interoperable)</span>
+              <p class="text-slate-400 leading-relaxed">
+                <strong>Pros:</strong> Interoperable with standard PGP tools (Thunderbird, GPG CLI, YubiKeys). Private key is never stored in BurnerBox.<br/>
+                <strong>Trade-off:</strong> Requires manual in-memory private key import per dashboard session.
+              </p>
+            </div>
+          </div>
+        </div>
 
         <p class="text-slate-400 text-sm mb-4">
-          Generate a new encryption keypair and re-encrypt all existing submissions.
-          The old key will no longer be able to decrypt messages.
+          Choose which cryptographic scheme to enforce for new anonymous submissions:
         </p>
+
+        <!-- Scheme Selector -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+          <button
+            type="button"
+            onclick={() => { targetScheme = 'libsodium'; }}
+            class="p-3 rounded-lg border text-left transition cursor-pointer {targetScheme === 'libsodium' ? 'bg-emerald-950/60 border-emerald-500 text-white ring-1 ring-emerald-500' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
+          >
+            <div class="font-bold text-sm text-emerald-400 mb-1">⚡ libsodium Keypair</div>
+            <p class="text-xs text-slate-400">Generate fresh browser keypair and re-encrypt tips.</p>
+          </button>
+
+          <button
+            type="button"
+            onclick={() => { targetScheme = 'pgp'; }}
+            class="p-3 rounded-lg border text-left transition cursor-pointer {targetScheme === 'pgp' ? 'bg-blue-950/60 border-blue-500 text-white ring-1 ring-blue-500' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
+          >
+            <div class="font-bold text-sm text-blue-400 mb-1">🛡️ PGP Public Key</div>
+            <p class="text-xs text-slate-400">Paste your existing ASCII-armored PGP key.</p>
+          </button>
+        </div>
+
+        <!-- PGP Key Input (if target is PGP) -->
+        {#if targetScheme === 'pgp'}
+          <div class="mb-4 bg-slate-900/60 p-3 rounded-lg border border-slate-700">
+            <label for="newPgpKey" class="block text-xs font-semibold text-slate-300 mb-1">
+              Paste ASCII-Armored PGP Public Key:
+            </label>
+            <textarea
+              id="newPgpKey"
+              bind:value={newPgpKey}
+              oninput={handlePGPKeyValidation}
+              rows="4"
+              placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----&#10;...&#10;-----END PGP PUBLIC KEY BLOCK-----"
+              class="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded text-emerald-400 font-mono text-xs placeholder-slate-600 focus:outline-none focus:border-blue-500 resize-none"
+            ></textarea>
+            {#if pgpValidation}
+              {#if pgpValidation.valid}
+                <p class="text-xs text-emerald-400 mt-1">
+                  ✅ Valid PGP Key (ID: {pgpValidation.keyID?.substring(0, 8)})
+                </p>
+              {:else}
+                <p class="text-xs text-red-400 mt-1">
+                  ❌ Invalid: {pgpValidation.error}
+                </p>
+              {/if}
+            {/if}
+          </div>
+        {/if}
 
         {#if rotationError}
           <div class="bg-red-900/50 border border-red-500 rounded-lg p-3 mb-4">
             <p class="text-red-400 text-sm">{rotationError}</p>
+          </div>
+        {/if}
+
+        {#if rotationSuccessMessage}
+          <div class="bg-emerald-900/50 border border-emerald-500 rounded-lg p-3 mb-4">
+            <p class="text-emerald-400 text-sm">✅ {rotationSuccessMessage}</p>
           </div>
         {/if}
 
@@ -621,13 +913,17 @@
         <button
           onclick={rotateKeys}
           disabled={rotating}
-          class="bg-yellow-600 hover:bg-yellow-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm transition cursor-pointer"
+          class="bg-yellow-600 hover:bg-yellow-700 disabled:bg-slate-600 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm transition cursor-pointer font-medium"
         >
-          {rotating ? 'Rotating...' : 'Rotate Encryption Keys'}
+          {rotating ? 'Updating...' : targetScheme === 'pgp' ? 'Save PGP Public Key' : 'Rotate libsodium Keys'}
         </button>
 
         <p class="text-slate-500 text-xs mt-3">
-          Team members will need to re-login after key rotation.
+          {#if targetScheme === 'pgp'}
+            Submissions submitted after switching will be encrypted with your PGP key.
+          {:else}
+            Team members will need to re-login after key rotation.
+          {/if}
         </p>
       </div>
 
@@ -963,5 +1259,149 @@
         </div>
       {/if}
     </div>
+
+    <!-- Danger Zone Card: Permanent Account Deletion -->
+    <div class="bg-red-950/20 border-2 border-red-900/60 rounded-xl p-6 shadow-xl mt-8">
+      <div class="flex items-start justify-between gap-4">
+        <div>
+          <div class="flex items-center gap-2 mb-2">
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-red-900/60 text-red-400 font-bold text-xs">⚠️</span>
+            <h2 class="text-lg font-bold text-red-300">
+              Danger Zone: Delete Organization Account
+            </h2>
+          </div>
+          <p class="text-slate-300 text-sm mb-3">
+            Permanently delete your entire organization and all associated data. This action is irreversible.
+          </p>
+          <div class="text-xs text-red-200/80 space-y-1 bg-red-950/40 p-3 rounded-lg border border-red-900/40">
+            <p class="font-semibold text-red-300">What will be permanently erased:</p>
+            <ul class="list-disc list-inside space-y-0.5 text-slate-300 ml-1">
+              <li>All encrypted submissions and uploaded attachments from disk</li>
+              <li>All reply messages, internal notes, and secure thread records</li>
+              <li>All cryptographic Merkle audit batches and leaves</li>
+              <li>All active user sessions, invitations, and team member accounts</li>
+              <li>Dead man's switch configurations, retention policies, and settings</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="mt-6 flex items-center justify-between pt-4 border-t border-red-900/40">
+        <div>
+          {#if userRole !== 'admin'}
+            <p class="text-xs text-amber-400">Only organization administrators can delete the account.</p>
+          {:else}
+            <p class="text-xs text-slate-400">Once deleted, your data cannot be recovered by anyone, including BurnerBox operators.</p>
+          {/if}
+        </div>
+        <button
+          onclick={openDeleteModal}
+          disabled={userRole !== 'admin'}
+          class="bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium px-4 py-2 rounded-lg text-sm transition cursor-pointer shadow-lg shadow-red-950/50"
+        >
+          Delete Account
+        </button>
+      </div>
+    </div>
+
+    <!-- Permanent Deletion Confirmation Modal -->
+    {#if deleteModalOpen}
+      <div
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-y-auto"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="delete-account-title"
+      >
+        <div class="bg-slate-900 border-2 border-red-600/80 rounded-2xl max-w-lg w-full p-6 shadow-2xl text-white relative">
+          <div class="flex items-center gap-3 text-red-400 mb-4 pb-3 border-b border-red-900/40">
+            <div class="w-10 h-10 rounded-full bg-red-900/40 border border-red-600 flex items-center justify-center font-bold text-lg">
+              ⚠️
+            </div>
+            <div>
+              <h3 id="delete-account-title" class="text-lg font-bold text-white">Permanently Delete Account?</h3>
+              <p class="text-xs text-red-300">This action CANNOT be undone.</p>
+            </div>
+          </div>
+
+          <div class="space-y-4 text-sm text-slate-300 mb-6">
+            <p>
+              You are about to <strong class="text-red-400 font-semibold">hard-delete your organization and all tied records</strong>.
+              All submissions, encrypted files on disk, replies, notes, Merkle leaves, team members, and settings will be permanently wiped.
+            </p>
+
+            {#if deleteError}
+              <div class="bg-red-950/80 border border-red-500 rounded-lg p-3 text-red-200 text-xs">
+                {deleteError}
+              </div>
+            {/if}
+
+            <div>
+              <label for="delete-password" class="block text-xs font-semibold text-slate-300 mb-1">
+                Enter your admin password:
+              </label>
+              <input
+                id="delete-password"
+                type="password"
+                bind:value={deletePassword}
+                placeholder="Current password"
+                disabled={deleteLoading}
+                class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-red-500 text-sm"
+              />
+            </div>
+
+            {#if totpEnabled}
+              <div>
+                <label for="delete-totp" class="block text-xs font-semibold text-slate-300 mb-1">
+                  Enter 6-digit 2FA / TOTP Code:
+                </label>
+                <input
+                  id="delete-totp"
+                  type="text"
+                  inputmode="numeric"
+                  maxlength="6"
+                  bind:value={deleteTotpCode}
+                  placeholder="123456"
+                  disabled={deleteLoading}
+                  class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white font-mono tracking-widest text-center focus:outline-none focus:border-red-500 text-sm"
+                />
+              </div>
+            {/if}
+
+            <div>
+              <label for="delete-confirm-text" class="block text-xs font-semibold text-slate-300 mb-1">
+                To confirm, type <span class="font-mono text-red-400 font-bold">DELETE</span> below:
+              </label>
+              <input
+                id="delete-confirm-text"
+                type="text"
+                bind:value={deleteConfirmationText}
+                placeholder="DELETE"
+                disabled={deleteLoading}
+                class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:border-red-500 text-sm font-mono"
+              />
+            </div>
+          </div>
+
+          <div class="flex justify-end gap-3 pt-3 border-t border-slate-800">
+            <button
+              type="button"
+              onclick={closeDeleteModal}
+              disabled={deleteLoading}
+              class="px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 text-sm rounded-lg transition cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onclick={handleDeleteAccount}
+              disabled={deleteLoading || !deletePassword || (totpEnabled && !deleteTotpCode.trim()) || deleteConfirmationText.trim().toUpperCase() !== 'DELETE'}
+              class="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium text-sm rounded-lg transition cursor-pointer shadow-lg shadow-red-950/60"
+            >
+              {deleteLoading ? 'Deleting Account...' : 'Permanently Delete Everything'}
+            </button>
+          </div>
+        </div>
+      </div>
+    {/if}
   </div>
 </div>

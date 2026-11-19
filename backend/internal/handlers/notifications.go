@@ -117,8 +117,8 @@ func UpdateRetentionSettings(c *fiber.Ctx) error {
 
 	log.Printf("RETENTION_UPDATE: org=%s days=%v", orgID, req.RetentionDays)
 	return c.JSON(fiber.Map{
-		"message":         "Retention policy updated",
-		"retention_days":  org.RetentionDays,
+		"message":        "Retention policy updated",
+		"retention_days": org.RetentionDays,
 	})
 }
 

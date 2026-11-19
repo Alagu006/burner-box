@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { API_URL } from '$lib/api';
-  import { clearDerivedKey } from '$lib/crypto';
+  import { logout } from '$lib/auth';
 
   let orgData = $state(null);
   let error = $state('');
@@ -35,7 +35,7 @@
     } else {
       error = 'Not logged in';
       loading = false;
-      setTimeout(() => window.location.href = '/login', 2000);
+      setTimeout(() => logout('', '/login'), 2000);
     }
   });
 
@@ -49,7 +49,7 @@
       });
 
       if (response.status === 401) {
-        handleLogout();
+        await handleLogout();
         return;
       }
 
@@ -75,11 +75,8 @@
     }
   }
 
-  function handleLogout() {
-    clearDerivedKey();
-    localStorage.removeItem('burnerbox_token');
-    localStorage.removeItem('burnerbox_org');
-    window.location.href = '/login';
+  async function handleLogout() {
+    await logout(token);
   }
 
   function copySubmissionUrl() {
@@ -132,9 +129,15 @@
         </p>
         
         <!-- Quick Links -->
-        <div class="flex gap-4 mt-4">
+        <div class="flex flex-wrap gap-4 mt-4">
           <a href="/dashboard/security" class="text-emerald-400 hover:text-emerald-300 text-sm">
             🔐 Security Settings
+          </a>
+          <a href="/dashboard/sessions" class="text-emerald-400 hover:text-emerald-300 text-sm">
+            🛡️ Active Sessions
+          </a>
+          <a href="/dashboard/customization" class="text-emerald-400 hover:text-emerald-300 text-sm">
+            🎨 Portal Customization
           </a>
           <a href="/dashboard/team" class="text-emerald-400 hover:text-emerald-300 text-sm">
             👥 Team Members

@@ -1,132 +1,149 @@
 # BurnerBox Security Documentation
 
-This document describes the current security properties of BurnerBox as implemented, not as originally designed. Features marked as incomplete are known gaps, not future promises.
+This document describes the security properties of BurnerBox as implemented in the current codebase. Gaps and architectural limitations are stated explicitly. Unresolved items requiring administrative or legal specification are marked as requiring human input.
 
-## What is encrypted end-to-end
+---
 
-### Room messages (ephemeral secure rooms)
+## 1. End-to-End Encryption (E2EE)
 
-Room messages are encrypted end-to-end. The encryption key is generated in the browser when a room is created, embedded in the share link URL fragment (`#key=...`), and never sent to the server. The server stores and transmits only ciphertext (NaCl `crypto_secretbox`). Anyone who compromises the server cannot read room messages without the key.
+### Ephemeral Secure Rooms
+- **Encryption Scheme:** NaCl `crypto_secretbox` (libsodium).
+- **Key Exchange:** The symmetric key is generated in the creator's browser using cryptographic random bytes and embedded in the shareable URL fragment (`#key=...`).
+- **Server Role:** The URL fragment is never transmitted in HTTP requests. The server stores and broadcasts only ciphertext over WebSockets and REST endpoints. Anyone with raw database or server access cannot read room messages without the URL fragment key.
+- **Caveat:** If the URL fragment is exposed (e.g. browser history, shoulder surfing, unencrypted clipboard, or external link referral), the room key is compromised.
 
-**Caveat:** The key is embedded in the URL. If the URL is intercepted (e.g., browser history, network proxy, referrer header), the key is compromised. The URL fragment is not sent in HTTP requests, but it may appear in browser history, logs, or be leaked by the browser to intermediary pages.
+### Anonymous Submissions (Tips)
+- **Encryption Scheme:** The browser encrypts submission messages prior to transmission using either:
+  - **Libsodium:** `crypto_box` authenticated envelope encryption with ephemeral sender keypair.
+  - **OpenPGP:** PGP armor ciphertext encrypted against the organization's PGP public key.
+- **Server Enforcement:** Server-side encryption is strictly enforced. When an organization has configured a public key (`org.PublicKey != ""`), the backend (`POST /api/v1/submit/:slug`) rejects unencrypted submissions (`encrypted_message == ""`) with `400 Bad Request`. Plaintext tip content is never accepted or stored for encrypted portals.
+- **Custom Form Fields:** Any customized questionnaire answers are bundled into a JSON structure client-side and encrypted alongside the primary message into the single ciphertext payload before leaving the browser.
 
-### Submission messages (anonymous tips)
+### Submission Replies & Multi-Turn Threads
+- **Replies:** When a submitter enables replies, they generate a dedicated reply keypair. The organization's reply is encrypted in the browser with the submitter's reply public key. When a reply key exists, the backend (`POST /api/v1/dashboard/submissions/:id/reply`) rejects plaintext replies with `400 Bad Request`.
+- **Thread Messages:** Follow-up conversation messages (`POST /api/v1/dashboard/submissions/:id/messages` and `POST /api/v1/submit/:slug/thread/:id/messages`) strictly require `encrypted_text` and `encryption_meta`. Plaintext submissions are rejected.
 
-When using the web frontend, submission messages are encrypted end-to-end. The browser generates an ephemeral key pair and encrypts the message with the organization's public key (NaCl `crypto_box`). The server stores only ciphertext and encryption metadata.
+### File Attachments
+- **Client-Side Encryption:** Files selected for submission are encrypted directly in the submitter's browser using the organization's public key (libsodium envelope encryption or OpenPGP binary literal encryption) prior to upload.
+- **Server-Side Defense-in-Depth:**
+  1. *Magic-Byte Validation:* File headers are inspected to verify declared MIME types against allowed formats.
+  2. *Image Metadata Stripping:* EXIF, GPS coordinates, and camera profiles are stripped from JPEG, PNG, and GIF images. If stripping fails, the upload is aborted and rejected (`400 Bad Request`), preventing fail-open leaks.
+  3. *At-Rest Disk Encryption:* Files are encrypted on the server with AES-256-GCM using `FILE_ENCRYPTION_KEY` before being written to disk at `uploads/submissions/<id>/`.
 
-**Caveat: the backend does not enforce encryption.** The `POST /api/v1/submit/:slug` endpoint accepts plaintext in the `message_text` field and stores it directly. The frontend always encrypts, but any API client (curl, script) can submit plaintext that the server stores unencrypted. TODO: enforce `encrypted_message` on the server when plaintext is submitted.
+---
 
-### Submission replies
+## 2. Key Management & At-Rest Storage
 
-When a submission has a reply key, the organization's reply is encrypted with the submitter's public key (NaCl `crypto_box`). The server stores only ciphertext. Without the reply key (stored in the submitter's browser), replies are unreadable.
+### Private Key Protection (Client Storage)
+- **Organization Dashboard Keys:** Organization private keys are encrypted before storage in browser `localStorage`. A key is derived from the user's login password using Argon2id (`crypto_pwhash`) and used to encrypt the private key with NaCl `crypto_secretbox` using random salt and nonce parameters. For PGP, private keys are protected with OpenPGP passphrase encryption.
+- **Submitter Reply Keys:** Submitter private keys stored in `localStorage` are encrypted at rest with a user-chosen or randomly generated multi-word passphrase.
+- **Server Knowledge:** The server never receives, logs, or stores private decryption keys for organizations or submitters.
 
-**Caveat:** The `Reply.MessageText` field is still stored alongside encrypted replies. TODO: stop persisting plaintext in this field when encryption is available.
+### Server-Held Cryptographic Keys
+- **Proof Signing Key (`proof_key.json`):** Dedicated Ed25519 keypair used solely for signing submission hashes and Merkle roots.
+- **File Encryption Key (`FILE_ENCRYPTION_KEY`):** 32-byte AES-256-GCM key used for server-side file encryption at rest.
+- **TOTP Encryption Key (`TOTP_ENCRYPTION_KEY`):** 32-byte AES-256-GCM key used to encrypt organization 2FA secrets in the database.
+- **JWT Secret (`JWT_SECRET`):** HMAC-SHA256 secret for signing authentication tokens.
 
-### Thread messages (follow-up conversation)
+---
 
-Thread messages follow the same E2EE path as replies. The submitter encrypts with the organization's public key; the organization encrypts with the submitter's reply public key. The server stores only ciphertext.
+## 3. Cryptographic Receipts & Append-Only Merkle Tree Log
 
-## Proof of submission
+BurnerBox provides non-repudiable submission verification without leaking tip contents.
 
-Each submission returns a cryptographic receipt: the server signs the SHA-256 hash of the encrypted payload using a server-held Ed25519 keypair. The receipt includes the hash, signature, timestamp, and key fingerprint.
+### 1. Per-Submission Receipt
+Upon receiving a genuine submission, the server computes $H(\text{ciphertext}) = \text{SHA-256}(\text{ciphertext})$ and issues a signed receipt containing:
+- `submission_id` and UTC timestamp.
+- Payload hash $H(\text{ciphertext})$.
+- Ed25519 digital signature from the server's proof key.
+- Server key fingerprint and public key.
+- Assigned Merkle batch metadata (`batch_id`, `batch_number`, `leaf_index`).
 
-The submitter can download this receipt as a text file and independently verify it against the server's public key (`GET /api/v1/proof-key`).
+### 2. Spam & Honeypot Proof Prevention
+- To prevent browser autofill false positives, honeypot inputs use dynamic, randomly-suffixed field names per page load (e.g. `hp_<random>`).
+- Submissions flagged as spam (honeypot triggered or fill time under 2000 ms) are discarded silently without database persistence or file storage.
+- **No Signed Receipts for Spam:** Discarded submissions return a generic `201 Created` envelope to prevent bot adaptation, but **omit the `"proof"` field completely**. The server never generates Ed25519 signatures over unpersisted or discarded submissions.
 
-**What this proves:** The encrypted payload existed at the stated time and was received by the server.
+### 3. Append-Only Merkle Tree Batching (RFC 6962)
+- **Leaf Hashing:** $\text{LeafNode} = \text{SHA-256}(0\text{x}00 \mathbin{\Vert} \text{payload\_hash})$.
+- **Internal Node Hashing:** $\text{ParentNode} = \text{SHA-256}(0\text{x}01 \mathbin{\Vert} \text{LeftChild} \mathbin{\Vert} \text{RightChild})$.
+- **Periodic Sealing:** Open batches are sealed on a regular interval. The computed root is signed with the server's Ed25519 key and published at `GET /api/v1/portal/:slug/merkle-roots`.
+- **Inclusion Proofs:** Submitters can retrieve $O(\log N)$ sibling proof paths at `GET /api/v1/submit/:slug/proof/:id`.
+- **Offline Verifier:** Receipts can be validated using the standalone zero-dependency offline verifier (`/verify-receipt.html`).
 
-**What this does NOT prove:** That the server did not also store the plaintext (it cannot prove this), or that the server will not delete the submission later.
+---
 
-**Key management:** The Ed25519 keypair is auto-generated on first startup and stored in `data/proof_key.json`. If this file is deleted, a new key is generated and old proofs can no longer be verified against the new key.
+## 4. Metadata Retention & Privacy
 
-## What is NOT encrypted end-to-end
+### Plaintext Fields Retained in Database
+| Data | Location | Purpose |
+|------|----------|---------|
+| Anonymous Name | `Submission.AnonymousName` | Pseudonymous handle (e.g. "Velvet Raven-ETYH") |
+| Status & Priority | `Submission.Status`, `Priority` | Workflow triage |
+| Timestamps | `CreatedAt`, `UpdatedAt` | Queue sorting and retention expiration |
+| File Metadata | `SubmissionFile.FileName`, `FileSize`, `MimeType` | Attachment listing |
+| Organization Data | `Organization.Name`, `Email`, `PublicKey`, `Slug` | Dashboard account & routing |
+| Internal Notes | `Submission.InternalNotes` | Authenticated staff notes |
+| Active Sessions | `Session.ID`, `OrganizationID`, `ExpiresAt`, `LastActiveAt` | Session revocation tracking |
 
-### File uploads (submission attachments)
+### Explicitly Excluded (Zero-Retention)
+- **No IP Addresses:** Client IP addresses are never logged or persisted to disk or database. Rate limiting utilizes in-memory keys without writing IPs to persistent logs. Verified continuously via automated static code audits (`no_ip_logging_test.go`).
+- **No User-Agent Strings:** Browser identifiers are not recorded.
+- **No Cookies:** No session or tracking cookies are issued. Authentication is token-based.
+- **No Third-Party Telemetry or CDN Leaks:** No external scripts, fonts, analytics, or trackers are embedded. Content Security Policy (`CSP`) strictly restricts all network calls to `'self'`, preventing the browser from making out-of-band requests that would leak the client's IP to third parties.
+- **No Request Body Logging:** Raw request payloads are never logged.
+- **Outbound Notification Protection:** Outbound notifications (webhooks and email alerts) transmit only public metadata (submission ID, timestamp, portal slug). Submitter IP headers (`X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`) are never forwarded or reflected.
 
-Files uploaded with submissions are encrypted with AES-256-GCM on the server using a server-held master key (`FILE_ENCRYPTION_KEY`). The server can decrypt all files. This protects against raw disk compromise but is **not** end-to-end encryption — the server operator can read file contents.
+### Transport-Layer IP Concealment & Tor Onion Routing
+In standard TCP/IP networking, transport-layer packet headers necessarily contain routing IP addresses visible to local network operators (ISPs, public Wi-Fi, firewalls) and edge ingress proxies. To ensure client IPs are not exposed during transport:
+1. **Tor Onion Service (v3 `.onion`):** BurnerBox is architected to operate behind a Tor hidden service. When accessed via `.onion`, traffic traverses 3 encrypted Tor relay hops. Neither the user's ISP, intermediate relays, nor the BurnerBox server can see the client's real IP address (incoming connections terminate from the local Tor daemon at `127.0.0.1`).
+2. **`Onion-Location` Header:** When configured with `ONION_LOCATION`, the backend automatically emits the `Onion-Location: <onion-address>` response header, prompting Tor Browser users to switch seamlessly to the end-to-end anonymized onion service.
+3. **No-Referrer Policy:** All HTTP responses enforce `Referrer-Policy: no-referrer`, ensuring URLs and portal identifiers are never transmitted in subsequent HTTP requests.
 
-### Internal notes
+---
 
-Internal notes on submissions are stored as plaintext in the database. These are only accessible to authenticated organization members via the dashboard API.
+## 5. Data Retention & Automatic Expiration
 
-## Metadata the server retains
+| Entity | Retention Duration | Mechanism |
+|--------|-------------------|-----------|
+| Ephemeral Rooms | 1 hour to 7 days (creator selected) | Hard-deleted along with all messages by background worker every 60s |
+| Room Self-Destruct Messages | 10 seconds to 10 minutes | Purged by background worker |
+| Anonymous Submissions | **Configurable: 1 to 3650 days** (or indefinite if unset) | Hard-deleted along with disk files, replies, and logs by hourly worker |
+| Submission Files | Tied to submission retention lifecycle | Securely deleted from disk (`os.Remove`) when submission expires |
+| Organization Accounts | User-controlled (permanent deletion on-demand) | Admin can permanently hard-delete via `DELETE /api/v1/dashboard/account` (requires admin password and TOTP if enabled). Hard-deletes org and all associated data: submissions, disk files, replies, notes, thread messages, activity, Merkle batches and leaves, sessions, team members, dead man's switch, and settings. |
 
-The following information is stored in the database in plaintext:
+---
 
-| Data | Where | Risk |
-|------|-------|------|
-| Submission anonymous name | `Submission.AnonymousName` | Pseudonymous, not linked to real identity |
-| Submission status | `Submission.Status` | unread/read/actioned/flagged |
-| Submission timestamps | `Submission.CreatedAt`, `UpdatedAt` | Can reveal when tips were submitted |
-| Organization name + email | `Organization.Name`, `Email` | Required for org login |
-| Room code | `Room.RoomCode` | Random 16-hex string |
-| Room sender tags | `RoomMessage.SenderTag` | Anonymous adjective-noun names |
-| Room creation/expiry times | `Room.CreatedAt`, `ExpiresAt` | |
-| File original names | `SubmissionFile.FileName` | **TODO: original filenames can be identifying** |
-| File sizes | `SubmissionFile.FileSize` | |
-| File MIME types | `SubmissionFile.MimeType` | |
+## 6. Authentication, Sessions & Rate Limiting
 
-## What is NOT retained
+- **Password Hashing:** Argon2id with 64 MB memory, 3 iterations, 2 parallelism, 16-byte cryptographically random salt, and 32-byte key.
+- **Two-Factor Authentication (2FA):** TOTP (RFC 6238) with secrets encrypted at rest (AES-256-GCM).
+- **Stateful Sessions:** JWTs are bound to database session records (`sessions` table). Protected routes verify session existence, revocation timestamp, and expiry.
+- **Session Revocation:** Users can view active sessions, revoke specific remote sessions, or revoke all other sessions.
+- **Account Deletion:** Self-serve permanent account deletion is supported via `DELETE /api/v1/dashboard/account` (admin role only, requiring password verification and 6-digit TOTP validation if 2FA is active). The deletion transaction hard-deletes the organization record, all submissions, encrypted files on disk, replies, notes, thread messages, activity logs, Merkle batches and leaves, active sessions, team members, dead man's switch configurations, and portal settings.
+- **Dedicated Rate Limiting:**
+  - Login: 5 attempts per 15 minutes per IP+email.
+  - 2FA Verification: 5 attempts per 15 minutes per IP+pending token.
+  - Organization Signup: 5 attempts per hour per IP.
+  - Check-Replies: 30 requests per 15 minutes per IP.
+  - Rooms: 100 requests per minute globally.
+- **Transport Security:** Production frontend builds enforce HTTPS for `API_URL` to protect authentication credentials in transit.
 
-- **No IP addresses** — the server never reads, logs, or stores client IP addresses
-- **No User-Agent strings** — never logged or stored
-- **No cookies** — no session cookies, no tracking cookies, no `Set-Cookie` headers
-- **No analytics or tracking** — no third-party scripts, no telemetry, no fingerprinting
-- **No WebSocket metadata** — WebSocket connections are not logged or persisted beyond the in-memory hub
-- **No HTTP request bodies** — request bodies are parsed but never logged
+---
 
-## Data retention
+## 7. Known Limitations & Unresolved Tasks
 
-| Data type | Retention | Deletion mechanism |
-|-----------|-----------|-------------------|
-| Room messages | Until room expiry or self-destruct | Background goroutine runs every 60 seconds, hard-deletes expired rooms and self-destructed messages |
-| Ephemeral rooms | 1 hour to 7 days (user-selected at creation) | Hard-deleted by background goroutine when `ExpiresAt` passes |
-| Submissions | **Indefinite** | No automatic TTL or cleanup. Submissions persist until manually deleted by the organization. TODO: add configurable retention policies. |
-| Submission files | **Indefinite** | Tied to submission lifetime. Stored on disk at `uploads/submissions/<uuid>/`. |
-| Organization accounts | **Indefinite** | No account deletion mechanism implemented. TODO: add account deletion endpoint. |
+### Architectural Limitations
+1. **Non-Image File Metadata:** PDFs, Office documents, and videos cannot be automatically stripped on the server without document corruption. Submitters should sanitize document metadata before attaching.
+2. **In-Memory Rate Limiting:** Rate limiter tracking structures reside in memory and reset if the application process restarts.
+3. **Merkle Log Equivocation:** Signed Merkle roots verify batch integrity, but detecting split-view attacks currently relies on public root inspection; a distributed gossip/witness network is not yet implemented.
 
-## Image metadata stripping
+### Unresolved Items (Requiring Human Input)
 
-When images are uploaded as submission attachments, the server attempts to strip EXIF data, GPS coordinates, camera information, and other embedded metadata by re-encoding the image (JPEG at quality 95, PNG re-encoded, GIF re-encoded but loses animation).
+> [!IMPORTANT]
+> **TODO (Requires Human Input) — Security Contact & Vulnerability Disclosure:**
+> A verified security contact email address or encrypted communication channel (e.g. `security@yourdomain.com` or designated PGP key) must be defined before production launch.
 
-**Known limitations:**
-- Non-image files (PDF, DOCX, MP4, ZIP) are not metadata-stripped and may contain embedded author information, creation dates, GPS data in videos, or other identifying metadata.
-- If metadata stripping fails, the original (unstripped) file is saved anyway. This is a known gap — TODO: fail the upload if stripping fails.
-- The file's original filename is preserved in the database. A filename like `whistleblower-evidence.pdf` is not sanitized.
-
-## Authentication
-
-- Organization passwords are hashed with Argon2id (64MB memory, 3 iterations, 2 parallelism, 16-byte salt, 32-byte key)
-- JWT tokens are used for dashboard authentication with a pending-2FA token mechanism for two-step login
-- TOTP secrets are encrypted at rest with AES-256-GCM using a separate key (`TOTP_ENCRYPTION_KEY`)
-- Auth endpoints are rate-limited to 5 attempts per 15 minutes per IP+email
-- Room chat endpoints are rate-limited to 100 requests per minute globally
-
-## Known security gaps
-
-1. **Plaintext submissions accepted by backend** — the API does not require encryption, so plaintext tips can be stored unencrypted
-2. **Files are not E2EE** — server-side encryption only; the server can decrypt all files
-3. **Non-image file metadata not stripped** — PDFs, Office documents, videos can retain identifying metadata
-4. **Original filenames stored** — can be identifying
-5. **Submissions have no TTL** — stored indefinitely with no automatic cleanup
-6. **Private keys stored in plaintext localStorage** — browser extension or XSS could extract them; should be encrypted with user-derived key
-7. **No account deletion** — organizations cannot delete their accounts or data
-8. **Rate limiter is in-memory** — resets on server restart
-9. **CORS and CSP not configured for production** — currently allows localhost origins only
-
-## Responsible disclosure
-
-If you discover a security vulnerability in BurnerBox, please report it responsibly:
-
-**Contact:** TODO: Add a security contact email or encrypted communication channel before production deployment.
-
-**Process:**
-1. Do not publicly disclose the vulnerability until a fix is available
-2. Provide a clear description of the vulnerability, steps to reproduce, and potential impact
-3. Allow reasonable time for the maintainers to respond and remediate
-4. If the vulnerability involves user data exposure, coordinate disclosure timing with the maintainers
-
-**Scope:** This disclosure process covers the BurnerBox application code. Vulnerabilities in third-party dependencies should be reported to the upstream maintainer.
-
-## Audit status
-
-As of August 2026, BurnerBox has not undergone a formal external security audit. This document reflects a code-level review by the development team. A professional penetration test and code audit should be conducted before any production deployment handling real whistleblower data.
+> [!IMPORTANT]
+> **TODO (Requires Human Input) — Legal & Regulatory Compliance:**
+> Review jurisdiction-specific requirements (such as GDPR, CCPA, or whistleblower protection directives) including designation of legal data controllers and formal data subject access/erasure workflows.

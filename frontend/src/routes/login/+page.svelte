@@ -1,6 +1,7 @@
 <script>
   import { API_URL } from '$lib/api';
   import { deriveKeyFromPassword, cacheDerivedKey } from '$lib/crypto';
+  import { t } from '$lib/i18n';
 
   let email = $state('');
   let password = $state('');
@@ -10,6 +11,13 @@
   let success = $state(false);
   let requires2FA = $state(false);
   let pendingToken = $state('');
+  let deletedNotice = $state(false);
+
+  $effect(() => {
+    if (typeof window !== 'undefined' && window.location.search.includes('deleted=true')) {
+      deletedNotice = true;
+    }
+  });
 
   async function handleLogin(e) {
     if (e) e.preventDefault();
@@ -17,9 +25,6 @@
     loading = true;
 
     try {
-      // SECURITY TODO: Replace hardcoded URL with an environment variable
-      // (e.g. import { PUBLIC_API_URL } from '$env/dynamic/public').
-      // In production this MUST be HTTPS — credentials are sent in the request body.
       const response = await fetch(`${API_URL}/api/v1/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -123,13 +128,20 @@
     
     <div class="text-center mb-6">
       <h1 class="text-3xl font-bold text-emerald-500">🔥 BurnerBox</h1>
-      <p class="text-slate-400 mt-2">Organization Login</p>
+      <p class="text-slate-400 mt-2">{$t('auth.login_title')}</p>
     </div>
+
+    {#if deletedNotice}
+      <div class="bg-red-950/60 border border-red-600 rounded-lg p-4 mb-6 text-center">
+        <p class="text-red-300 font-semibold text-sm">Organization account permanently deleted.</p>
+        <p class="text-slate-400 text-xs mt-1">All data, submissions, attachments, and keys have been wiped.</p>
+      </div>
+    {/if}
 
     {#if success}
       <div class="bg-emerald-900/50 border border-emerald-500 rounded-lg p-4 text-center">
-        <p class="text-emerald-400 text-lg">✅ Login Successful!</p>
-        <p class="text-slate-400 text-sm mt-1">Redirecting to dashboard...</p>
+        <p class="text-emerald-400 text-lg">{$t('auth.login_success')}</p>
+        <p class="text-slate-400 text-sm mt-1">{$t('auth.redirecting')}</p>
       </div>
     {:else if requires2FA}
       <form onsubmit={handleVerify2FA}>
@@ -141,11 +153,11 @@
         {/if}
 
         <div class="bg-slate-700/50 border border-slate-600 rounded-lg p-4 mb-4">
-          <p class="text-slate-300 text-sm">Enter the 6-digit code from your authenticator app.</p>
+          <p class="text-slate-300 text-sm">{$t('auth.2fa_prompt')}</p>
         </div>
 
         <div class="mb-6">
-          <label for="totp" class="block text-sm font-medium text-slate-300 mb-1">Authentication Code</label>
+          <label for="totp" class="block text-sm font-medium text-slate-300 mb-1">{$t('auth.2fa_label')}</label>
           <input
             id="totp"
             type="text"
@@ -162,17 +174,17 @@
         <button
           type="submit"
           disabled={loading || totpCode.length !== 6}
-          class="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-600 text-white py-2 rounded-lg font-medium transition"
+          class="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-600 text-white py-2 rounded-lg font-medium transition cursor-pointer"
         >
-          {loading ? 'Verifying...' : '🔐 Verify'}
+          {loading ? $t('auth.verifying') : $t('auth.verify_btn')}
         </button>
 
         <button
           type="button"
           onclick={() => { requires2FA = false; pendingToken = ''; totpCode = ''; error = ''; }}
-          class="w-full text-slate-400 hover:text-slate-300 py-2 text-sm mt-3 transition"
+          class="w-full text-slate-400 hover:text-slate-300 py-2 text-sm mt-3 transition cursor-pointer"
         >
-          ← Back to login
+          {$t('auth.back_to_login')}
         </button>
       </form>
     {:else}
@@ -185,7 +197,7 @@
         {/if}
 
         <div class="mb-4">
-          <label for="email" class="block text-sm font-medium text-slate-300 mb-1">Email</label>
+          <label for="email" class="block text-sm font-medium text-slate-300 mb-1">{$t('auth.email')}</label>
           <input
             id="email"
             type="email"
@@ -197,7 +209,7 @@
         </div>
 
         <div class="mb-6">
-          <label for="password" class="block text-sm font-medium text-slate-300 mb-1">Password</label>
+          <label for="password" class="block text-sm font-medium text-slate-300 mb-1">{$t('auth.password')}</label>
           <input
             id="password"
             type="password"
@@ -212,15 +224,15 @@
         <button
           type="submit"
           disabled={loading}
-          class="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-600 text-white py-2 rounded-lg font-medium transition"
+          class="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-600 text-white py-2 rounded-lg font-medium transition cursor-pointer"
         >
-          {loading ? 'Logging in...' : '🔐 Login'}
+          {loading ? $t('auth.logging_in') : $t('auth.login_btn')}
         </button>
       </form>
 
       <p class="text-center text-slate-400 text-sm mt-6">
-        Don't have an account?
-        <a href="/signup" class="text-emerald-500 hover:underline ml-1">Sign up</a>
+        {$t('auth.no_account')}
+        <a href="/signup" class="text-emerald-500 hover:underline ml-1">{$t('auth.signup_link')}</a>
       </p>
     {/if}
   </div>

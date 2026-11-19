@@ -26,6 +26,9 @@ openssl rand -base64 32
 
 # File encryption key (32 bytes, base64-encoded)
 openssl rand -base64 32
+
+# Proof-of-submission & Merkle batch signing key (32-byte Ed25519 seed, base64-encoded)
+openssl rand -base64 32
 ```
 
 You will set these as Fly secrets in step 3.
@@ -65,6 +68,8 @@ fly secrets set \
   JWT_SECRET="<output from openssl rand -base64 64>" \
   TOTP_ENCRYPTION_KEY="<output from openssl rand -base64 32>" \
   FILE_ENCRYPTION_KEY="<output from openssl rand -base64 32>" \
+  PROOF_SIGNING_PRIVATE_KEY="<output from openssl rand -base64 32>" \
+  PROOF_SIGNING_KEY_ID="bb-prod-2026-v1" \
   CORS_ORIGINS="https://your-domain.pages.dev" \
   API_URL="https://api.your-domain.com"
 ```
@@ -76,10 +81,13 @@ fly secrets set \
 | `JWT_SECRET` | HMAC key for signing JWT tokens |
 | `TOTP_ENCRYPTION_KEY` | AES-256 key for encrypting TOTP secrets at rest |
 | `FILE_ENCRYPTION_KEY` | AES-256 key for encrypting uploaded files at rest |
+| `PROOF_SIGNING_PRIVATE_KEY` | Base64-encoded Ed25519 32-byte seed or 64-byte private key for receipts and Merkle root signing |
 
 **Optional secrets:**
 | Secret | Default | Purpose |
 |--------|---------|---------|
+| `PROOF_SIGNING_KEY_ID` | `key_<fingerprint>` | Human-readable identifier for the active signing key (e.g. `bb-prod-2026-v1`) |
+| `PROOF_HISTORICAL_PUBLIC_KEYS` | _(empty)_ | JSON array of retired verification keys for historical receipt validation |
 | `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed origins |
 | `API_URL` | _(empty)_ | Public URL of this API (used for CSP WebSocket directives) |
 | `SUBMISSION_URL_PREFIX` | `http://localhost:5173/submit` | URL prefix for submission links |

@@ -9,9 +9,9 @@ import (
 
 // Submission represents an anonymous tip submitted to an organization
 type Submission struct {
-	ID             uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	OrganizationID uuid.UUID  `gorm:"type:uuid;not null;index" json:"organization_id"`
-	AnonymousName  string     `gorm:"size:100;not null" json:"anonymous_name"`
+	ID             uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	OrganizationID uuid.UUID `gorm:"type:uuid;not null;index" json:"organization_id"`
+	AnonymousName  string    `gorm:"size:100;not null" json:"anonymous_name"`
 
 	// E2EE fields (encrypted content stored as base64)
 	EncryptedMessage string `gorm:"type:text" json:"encrypted_message"` // Encrypted message content
@@ -22,19 +22,19 @@ type Submission struct {
 
 	// Reply key info
 	ReplyPublicKey string `gorm:"type:text" json:"reply_public_key,omitempty"` // Public key — safe to expose
-	HasReplyKey    bool   `gorm:"default:false" json:"has_reply_key"`         // Boolean flag
+	HasReplyKey    bool   `gorm:"default:false" json:"has_reply_key"`          // Boolean flag
 
 	// File info
 	HasFiles  bool `gorm:"default:false" json:"has_files"`
 	FileCount int  `gorm:"default:0" json:"file_count"`
 
 	// Status & priority
-	Status   string `gorm:"size:20;default:'unread'" json:"status"` // unread, read, actioned, flagged, archived
+	Status   string `gorm:"size:20;default:'unread'" json:"status"`   // unread, read, actioned, flagged, archived
 	Priority string `gorm:"size:20;default:'normal'" json:"priority"` // low, normal, high, urgent
 
 	// Assignment
-	AssignedTo *uuid.UUID `gorm:"type:uuid" json:"assigned_to,omitempty"` // Team member ID, nullable
-	InternalNotes string  `gorm:"type:text" json:"internal_notes"`
+	AssignedTo    *uuid.UUID `gorm:"type:uuid" json:"assigned_to,omitempty"` // Team member ID, nullable
+	InternalNotes string     `gorm:"type:text" json:"internal_notes"`
 
 	// Timestamps
 	CreatedAt time.Time `json:"created_at"`
@@ -86,7 +86,7 @@ type SubmissionMessage struct {
 	ID             uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
 	SubmissionID   uuid.UUID `gorm:"type:uuid;not null;index" json:"submission_id"`
 	AnonymousName  string    `gorm:"size:100;not null" json:"anonymous_name"` // Who sent it
-	SenderType     string    `gorm:"size:20;not null" json:"sender_type"`   // "submitter" or "org"
+	SenderType     string    `gorm:"size:20;not null" json:"sender_type"`     // "submitter" or "org"
 	EncryptedText  string    `gorm:"type:text" json:"encrypted_text"`
 	EncryptionMeta string    `gorm:"type:text" json:"encryption_meta"`
 	MessageText    string    `gorm:"type:text" json:"message_text"` // Legacy plaintext
@@ -156,7 +156,7 @@ type Activity struct {
 	ActorEmail     string    `gorm:"size:255;not null" json:"actor_email"`
 	ActorRole      string    `gorm:"size:50;not null" json:"actor_role"`
 	ActionType     string    `gorm:"size:50;not null" json:"action_type"` // status_change, assignment, note_added, reply_sent, thread_message
-	Detail         string    `gorm:"type:text" json:"detail"`            // e.g. "status: unread → read", "assigned to alice@example.com"
+	Detail         string    `gorm:"type:text" json:"detail"`             // e.g. "status: unread → read", "assigned to alice@example.com"
 	CreatedAt      time.Time `json:"created_at"`
 }
 

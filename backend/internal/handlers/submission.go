@@ -1,10 +1,13 @@
 package handlers
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +22,10 @@ type SubmissionRequest struct {
 	ReplyPublicKey   string `json:"reply_public_key,omitempty"`
 	EncryptedMessage string `json:"encrypted_message,omitempty"`
 	EncryptionMeta   string `json:"encryption_meta,omitempty"`
+	HoneypotField    string `json:"honeypot_field,omitempty"` // Dynamic honeypot field name (e.g. hp_xxx)
+	HoneypotValue    string `json:"honeypot_value,omitempty"` // Direct honeypot value if sent
+	HpToken          string `json:"hp_token,omitempty"`       // Fallback non-semantic honeypot field
+	RenderedAt       int64  `json:"rendered_at,omitempty"`    // Client page-load timestamp in milliseconds
 }
 
 type UpdateSubmissionRequest struct {
@@ -38,7 +45,7 @@ func GetOrganizationPublicKey(c *fiber.Ctx) error {
 	}
 
 	var org models.Organization
-	if err := models.DB.Select("public_key", "name", "submission_slug", "submission_deadline").
+	if err := models.DB.Select("public_key", "name", "submission_slug", "submission_deadline", "encryption_scheme", "welcome_message", "logo_url", "custom_fields").
 		Where("submission_slug = ?", slug).
 		First(&org).Error; err != nil {
 		return c.Status(404).JSON(fiber.Map{
@@ -52,9 +59,26 @@ func GetOrganizationPublicKey(c *fiber.Ctx) error {
 		})
 	}
 
+	scheme := org.EncryptionScheme
+	if scheme == "" {
+		scheme = "libsodium"
+	}
+
+	var customFields []map[string]interface{}
+	if org.CustomFields != "" {
+		_ = json.Unmarshal([]byte(org.CustomFields), &customFields)
+	}
+	if customFields == nil {
+		customFields = []map[string]interface{}{}
+	}
+
 	resp := fiber.Map{
 		"organization_name": org.Name,
 		"public_key":        org.PublicKey,
+		"encryption_scheme": scheme,
+		"welcome_message":   org.WelcomeMessage,
+		"logo_url":          org.LogoURL,
+		"custom_fields":     customFields,
 	}
 
 	if org.SubmissionDeadline != nil {
@@ -99,6 +123,36 @@ func SubmitAnonymousTip(c *fiber.Ctx) error {
 	encryptedMessage := c.FormValue("encrypted_message")
 	encryptionMeta := c.FormValue("encryption_meta")
 
+	// SPAM MITIGATION:
+	// Non-semantic honeypot field (dynamic randomly-suffixed name per page load, e.g. "hp_<random>")
+	// and client-rendered fill-time check provide low-effort spam and automated bot mitigation.
+	// Semantic field names like "website" or "confirm_email" are avoided so browser autofill
+	// does not mistakenly trigger spam discards for legitimate humans.
+	isSpam := false
+	renderedAtStr := c.FormValue("rendered_at")
+	var renderedAt int64
+	if renderedAtStr != "" {
+		renderedAt, _ = strconv.ParseInt(renderedAtStr, 10, 64)
+	}
+
+	honeypotFieldName := c.FormValue("honeypot_field")
+	var honeypotVal string
+	if honeypotFieldName != "" {
+		honeypotVal = c.FormValue(honeypotFieldName)
+	}
+	if honeypotVal == "" {
+		honeypotVal = c.FormValue("hp_token")
+	}
+
+	// Check any multipart form fields with "hp_" prefix
+	if form, err := c.MultipartForm(); err == nil && form != nil {
+		for key, vals := range form.Value {
+			if strings.HasPrefix(key, "hp_") && len(vals) > 0 && strings.TrimSpace(vals[0]) != "" {
+				isSpam = true
+			}
+		}
+	}
+
 	// If no form values, try parsing JSON body
 	if messageText == "" && encryptedMessage == "" {
 		var req SubmissionRequest
@@ -107,6 +161,51 @@ func SubmitAnonymousTip(c *fiber.Ctx) error {
 			replyPublicKey = req.ReplyPublicKey
 			encryptedMessage = req.EncryptedMessage
 			encryptionMeta = req.EncryptionMeta
+			if req.HoneypotField != "" {
+				honeypotFieldName = req.HoneypotField
+			}
+			if req.HoneypotValue != "" {
+				honeypotVal = req.HoneypotValue
+			}
+			if req.HpToken != "" {
+				honeypotVal = req.HpToken
+			}
+			if req.RenderedAt > 0 {
+				renderedAt = req.RenderedAt
+			}
+		}
+
+		// Also check dynamic field name or hp_* prefix in raw JSON
+		var rawJSON map[string]interface{}
+		if err := json.Unmarshal(c.Body(), &rawJSON); err == nil {
+			if honeypotFieldName != "" {
+				if val, ok := rawJSON[honeypotFieldName]; ok {
+					if s, ok := val.(string); ok && strings.TrimSpace(s) != "" {
+						honeypotVal = s
+					}
+				}
+			}
+			for k, v := range rawJSON {
+				if strings.HasPrefix(k, "hp_") {
+					if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+						isSpam = true
+					}
+				}
+			}
+		}
+	}
+
+	// 1. Honeypot check: Bots filling hidden non-semantic fields trigger silent discard
+	if strings.TrimSpace(honeypotVal) != "" {
+		isSpam = true
+	}
+
+	// 2. Minimum human fill-time check (< 2000 ms from page render)
+	if renderedAt > 0 {
+		nowMs := time.Now().UnixMilli()
+		// If submitted in under 2 seconds (2000ms) or timestamp is unreasonably far in future
+		if nowMs-renderedAt < 2000 || renderedAt > nowMs+5000 {
+			isSpam = true
 		}
 	}
 
@@ -142,6 +241,31 @@ func SubmitAnonymousTip(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{
 			"error": "Encryption metadata too long",
 		})
+	}
+
+	// Silently discard spam without persisting to database, saving files, or notifying org
+	if isSpam {
+		fakeID := uuid.New()
+		fakeAnonName := models.GenerateAnonymousName()
+		var fakeReplyHint string
+		if replyPublicKey != "" {
+			fakeReplyHint = "Your anonymous identity is: " + fakeAnonName +
+				". Save this name to check for replies. Return to the same URL and enter this name."
+		}
+		log.Printf("SPAM_DISCARDED: honeypot/fast-fill caught on slug=%s", slug)
+		fakeResp := fiber.Map{
+			"message":        "Submission received successfully",
+			"anonymous_name": fakeAnonName,
+			"submission_id":  fakeID,
+			"reply_hint":     fakeReplyHint,
+			"has_reply_key":  replyPublicKey != "",
+			"is_encrypted":   encryptedMessage != "",
+			"files_uploaded": 0,
+			"files":          []FileUploadResponse{},
+		}
+		// DO NOT issue a signed proof of submission for spam-discarded submissions.
+		// A fake receipt must never carry a production Ed25519 signature over an unpersisted ID.
+		return c.Status(201).JSON(fakeResp)
 	}
 	if len(replyPublicKey) > MaxReplyPublicKeysLen {
 		return c.Status(400).JSON(fiber.Map{
@@ -195,7 +319,10 @@ func SubmitAnonymousTip(c *fiber.Ctx) error {
 			storageKey, fileEncKey, procErr := processAndEncryptFile(submission.ID.String(), file, ext)
 			if procErr != nil {
 				log.Printf("processAndEncryptFile failed (submission %s): %v", submission.ID, procErr)
-				continue
+				models.DB.Delete(&submission)
+				return c.Status(400).JSON(fiber.Map{
+					"error": fmt.Sprintf("File validation failed for %s: %v", file.Filename, procErr),
+				})
 			}
 
 			// Detect the MIME type from the encrypted file for the DB record
@@ -263,8 +390,31 @@ func SubmitAnonymousTip(c *fiber.Ctx) error {
 		"files":          uploadedFiles,
 	}
 
-	// Generate proof of submission if server key is available
-	if proof := GenerateProofOfSubmission(submission.ID.String(), encryptedMessage); proof != nil {
+	// Generate proof of submission if server key is available and append leaf to organization's Merkle batch
+	payloadContent := encryptedMessage
+	if payloadContent == "" {
+		payloadContent = messageText
+	}
+
+	proof := GenerateProofOfSubmission(submission.ID.String(), payloadContent)
+	if proof != nil {
+		leaf, batch, err := AddSubmissionToMerkleBatch(org.ID, submission.ID, proof.Hash)
+		if err == nil && leaf != nil && batch != nil {
+			proof.BatchID = batch.ID.String()
+			proof.BatchNumber = batch.BatchNumber
+			proof.LeafIndex = leaf.LeafIndex
+			proof.LeafHash = leaf.LeafHash
+			proof.MerkleStatus = batch.Status
+			proof.PortalSlug = slug
+			proof.InclusionProofEndpoint = "/api/v1/submit/" + slug + "/proof/" + submission.ID.String()
+			proof.PublishedRootsEndpoint = "/api/v1/portal/" + slug + "/merkle-roots"
+
+			resp["batch_id"] = batch.ID
+			resp["batch_number"] = batch.BatchNumber
+			resp["leaf_index"] = leaf.LeafIndex
+			resp["leaf_hash"] = leaf.LeafHash
+			resp["merkle_status"] = batch.Status
+		}
 		resp["proof"] = proof
 	}
 
@@ -699,4 +849,3 @@ func CheckForReplies(c *fiber.Ctx) error {
 		"replies":        replies,
 	})
 }
-

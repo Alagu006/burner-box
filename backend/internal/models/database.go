@@ -26,6 +26,7 @@ func ConnectDatabase(databaseURL string) {
 	// Auto-migrate tables (creates tables if they don't exist)
 	err = DB.AutoMigrate(
 		&Organization{},
+		&Session{},
 		&TeamMember{},
 		&Submission{},
 		&SubmissionFile{},
@@ -38,6 +39,8 @@ func ConnectDatabase(databaseURL string) {
 		&RoomFile{},
 		&RoomReaction{},
 		&DeadMansSwitch{},
+		&MerkleBatch{},
+		&MerkleLeaf{},
 	)
 	if err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)

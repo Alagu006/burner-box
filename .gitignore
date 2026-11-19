@@ -49,3 +49,19 @@ frontend/.svelte-kit/
 # Uploaded files (don't commit user data)
 backend/uploads/
 uploads/
+
+# Cryptographic signing keys & local secrets (BB-SEC-001)
+backend/internal/handlers/data/proof_key.json
+data/proof_key.json
+**/proof_key.json
+**/*_private_key.*
+**/*private*.key
+**/*private*.pem
+**/*.priv.key
+**/*.priv.pem
+secrets/
+
+# Forensic archives containing compromised historical key material
+pre_remediation_checkpoint0.tar.gz
+pre_remediation_*.tar.gz
+BurnerBox_Project_Source_with_Master_Blueprint.zip

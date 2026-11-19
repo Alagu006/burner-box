@@ -51,9 +51,9 @@ func ExportSubmissions(c *fiber.Ctx) error {
 	}
 
 	type ExportFile struct {
-		FileName  string `json:"file_name"`
-		FileSize  int64  `json:"file_size"`
-		MimeType  string `json:"mime_type"`
+		FileName   string `json:"file_name"`
+		FileSize   int64  `json:"file_size"`
+		MimeType   string `json:"mime_type"`
 		StorageKey string `json:"storage_key"`
 		// Client encryption metadata (if file was client-side encrypted)
 		ClientEncMeta string `json:"client_encryption_meta,omitempty"`

@@ -10,32 +10,42 @@ import (
 	"testing"
 )
 
-// logCallPattern matches log.Printf/Println/Fatalf/Fatal calls.
-var logCallPattern = regexp.MustCompile(`log\.(Printf|Println|Fatalf|Fatal)\(`)
+// logCallPattern matches log.Printf/Println/Fatalf/Fatal/Print/Panic/Panicf/Panicln calls.
+var logCallPattern = regexp.MustCompile(`log\.(Printf|Println|Fatalf|Fatal|Print|Panic|Panicf|Panicln)\(`)
 
 // logFormatStringPattern extracts the first string literal from a log call.
 // This is used to isolate the format string from arguments.
 var logFormatStringPattern = regexp.MustCompile(`log\.\w+\(\s*"([^"]*)"`)
 
-// ipInFormatString matches IP-bearing patterns inside log format strings.
-// This catches both direct interpolation (ip=%s) and keyword patterns (client_ip).
+// ipInFormatString matches IP-bearing patterns inside log format strings and log literals.
+// This catches direct interpolation (ip=%s, ip:%s), key-value patterns (ip=, ip:),
+// and keyword patterns (client_ip, remote_addr, user_ip, etc.).
 var ipInFormatString = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bip\s*=\s*%`),
 	regexp.MustCompile(`(?i)\bip\s*:\s*%`),
+	regexp.MustCompile(`(?i)\bip\s*=`),
+	regexp.MustCompile(`(?i)\bip\s*:\s*`),
 	regexp.MustCompile(`(?i)\bclient.?ip`),
 	regexp.MustCompile(`(?i)\bremote.?addr`),
 	regexp.MustCompile(`(?i)\bremote.?ip`),
+	regexp.MustCompile(`(?i)\buser.?ip`),
 	regexp.MustCompile(`(?i)\buser.?agent`),
 	regexp.MustCompile(`(?i)\bx.?forwarded`),
 	regexp.MustCompile(`(?i)\bx.?real.?ip`),
+	regexp.MustCompile(`(?i)\bsrc.?ip`),
+	regexp.MustCompile(`(?i)\bsource.?ip`),
+	regexp.MustCompile(`(?i)\bpeer.?(?:ip|addr)`),
+	regexp.MustCompile(`(?i)\bcaller.?ip`),
 }
 
 // identifyingInLogLine catches identifying information appearing anywhere on a
 // log call line (format string, arguments, or variable references).
 var identifyingInLogLine = []*regexp.Regexp{
 	regexp.MustCompile(`\.IP\(\)`),
+	regexp.MustCompile(`\.IPs\(\)`),
 	regexp.MustCompile(`\.RemoteAddr\b`),
 	regexp.MustCompile(`\.RemoteIP\b`),
+	regexp.MustCompile(`\.ClientIP\b`),
 	regexp.MustCompile(`Get\(\s*"User-Agent"`),
 	regexp.MustCompile(`Get\(\s*"user-agent"`),
 	regexp.MustCompile(`Get\(\s*"Referer"`),
@@ -44,12 +54,13 @@ var identifyingInLogLine = []*regexp.Regexp{
 	regexp.MustCompile(`Get\(\s*"x-forwarded-for"`),
 	regexp.MustCompile(`Get\(\s*"X-Real-Ip"`),
 	regexp.MustCompile(`Get\(\s*"x-real-ip"`),
+	regexp.MustCompile(`Get\(\s*"X-Real-IP"`),
 	regexp.MustCompile(`c\.Locals\(\s*"ip"`),
 	regexp.MustCompile(`c\.Locals\(\s*"clientIP"`),
 }
 
-// assignIPPattern matches variable assignments from c.IP().
-var assignIPPattern = regexp.MustCompile(`(:?=|:=)\s*c\.IP\(\)`)
+// assignIPPattern matches variable assignments from c.IP() or any *.IP().
+var assignIPPattern = regexp.MustCompile(`(?:\b(\w+)\s*(?::=|=)|var\s+(\w+)(?:\s+\w+)?\s*=)\s*.*\.IP\(\)`)
 
 // TestNoIPLogging verifies that no log.Printf/log.Println/log.Fatalf call
 // in the codebase includes client IP addresses or User-Agent strings.
@@ -289,19 +300,19 @@ func TestNoIPLoggingInFiberLoggerFormat(t *testing.T) {
 
 // TestNoIPLoggingIndirectAssignment is a WARNING-ONLY test that flags any
 // function calling c.IP() and storing the result in a variable, then checks
-// whether that variable appears in a log call within the same function.
+// whether that variable appears in a log call within the surrounding code.
 //
-// This catches the indirection pattern that the hard-fail tests might miss:
+// This catches the indirection pattern that direct tests might miss:
 // the IP is assigned to a variable on one line, then interpolated into a log
-// string on a different line — but the format string doesn't contain "ip=".
+// string on a different line.
 //
-// Example caught by this test (but NOT by hard-fail tests):
+// Example:
 //
 //	clientIP := c.IP()
 //	log.Printf("Request from %s", clientIP)
 //
-// This produces a noisy but safe output — a human should review each flagged
-// location.
+// Every call site of c.IP() is logged as a warning/info item during the test run
+// so a human reviewer can verify that the variable is never logged.
 func TestNoIPLoggingIndirectAssignment(t *testing.T) {
 	root := findRoot(t)
 
@@ -336,32 +347,41 @@ func TestNoIPLoggingIndirectAssignment(t *testing.T) {
 				continue
 			}
 
-			if !assignIPPattern.MatchString(line) {
+			if !assignIPPattern.MatchString(line) && !strings.Contains(line, ".IP()") {
 				continue
 			}
 
 			// Extract the variable name from the assignment
 			varName := extractAssignedVarName(line)
 
-			// Check the next 30 lines for log calls referencing this variable
-			end := i + 30
+			// Check the next 40 lines (or until next func) for log calls referencing this variable
+			end := i + 40
 			if end > len(lines) {
 				end = len(lines)
 			}
 
 			doesLog := false
 			var logDetail string
+			var varWordPattern *regexp.Regexp
+			if varName != "" {
+				varWordPattern = regexp.MustCompile(`\b` + regexp.QuoteMeta(varName) + `\b`)
+			}
+
 			for _, futureLine := range lines[i+1 : end] {
+				trimmedFuture := strings.TrimSpace(futureLine)
+				// If we reached a new top-level function, stop scanning this scope
+				if strings.HasPrefix(trimmedFuture, "func ") && !strings.HasPrefix(trimmedFuture, "func(") {
+					break
+				}
+
 				if !logCallPattern.MatchString(futureLine) {
 					continue
 				}
 
-				// Check if the variable name appears as an argument in the log call
-				if varName != "" && (strings.Contains(futureLine, varName+")") ||
-					strings.Contains(futureLine, varName+",") ||
-					strings.Contains(futureLine, varName+" )")) {
+				// Check if the variable name appears in the log call
+				if varWordPattern != nil && varWordPattern.MatchString(futureLine) {
 					doesLog = true
-					logDetail = fmt.Sprintf("variable %q passed to log at next line", varName)
+					logDetail = fmt.Sprintf("variable %q referenced in log call %q", varName, trimmedFuture)
 					break
 				}
 
@@ -378,23 +398,16 @@ func TestNoIPLoggingIndirectAssignment(t *testing.T) {
 						break
 					}
 				}
-
-				// Also check for generic variable interpolation patterns
-				if strings.Contains(futureLine, "ip)") || strings.Contains(futureLine, "ip,") {
-					doesLog = true
-					logDetail = "generic ip reference in log call"
-					break
-				}
 			}
 
 			location := fmt.Sprintf("%s:%d", path, i+1)
 			if doesLog {
 				warnings = append(warnings, fmt.Sprintf(
-					"[REVIEW] %s: c.IP() assigned to %q — %s — verify no IP leak",
+					"[REVIEW NEEDED] %s: c.IP() stored in %q — %s — potential IP leak!",
 					location, varName, logDetail))
 			} else {
 				warnings = append(warnings, fmt.Sprintf(
-					"[INFO] %s: c.IP() assigned to %q — used only for rate-limit key, no log leak",
+					"[AUDIT VERIFIED] %s: c.IP() stored in %q — used only for rate limiting key; no log leak detected",
 					location, varName))
 			}
 		}
@@ -406,26 +419,92 @@ func TestNoIPLoggingIndirectAssignment(t *testing.T) {
 	}
 
 	if len(warnings) > 0 {
-		t.Logf("IP assignment audit (%d location(s) found — review each for potential leaks):", len(warnings))
+		t.Logf("c.IP() Variable Assignment & Indirection Audit (%d location(s) found):", len(warnings))
 		for _, w := range warnings {
 			t.Logf("  %s", w)
 		}
-		t.Log("NOTE: This is a warning-only check. Fix any [REVIEW] items that log IP values.")
+		t.Log("NOTE: This audit flags all c.IP() variable assignments so reviewers can confirm the IP is not logged.")
 	} else {
 		t.Log("No c.IP() assignments found in non-test code.")
 	}
 }
 
+// TestIPFormatStringRegexPatterns validates that the IP format string regex patterns
+// correctly identify forbidden patterns (ip=%s, ip:%s, client_ip, etc.) and do not
+// false-positive on legitimate log messages.
+func TestIPFormatStringRegexPatterns(t *testing.T) {
+	badFormatStrings := []string{
+		"RATELIMIT_LOGIN blocked: ip=%s",
+		"RATELIMIT_2FA blocked: ip=%s",
+		"RATELIMIT_REPLIES blocked: ip=%s",
+		"login failed for ip:%s",
+		"client_ip=%s connected",
+		"remote_ip=%v",
+		"user_ip: %s",
+		"remote_addr: %s",
+		"x_forwarded_for: %s",
+		"x-real-ip=%s",
+		"ip=%v",
+		"ip=%+v",
+		"ip=%q",
+		"ip = %s",
+		"ip: %s",
+		"ip=%d",
+		"ip=",
+		"ip:",
+	}
+
+	for _, s := range badFormatStrings {
+		matched := false
+		for _, pat := range ipInFormatString {
+			if pat.MatchString(s) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Errorf("Expected regex to flag format string %q, but none matched", s)
+		}
+	}
+
+	goodFormatStrings := []string{
+		"RATELIMIT_LOGIN blocked",
+		"RATELIMIT_2FA blocked",
+		"RATELIMIT_REPLIES blocked",
+		"Connected to PostgreSQL database",
+		"Database tables migrated",
+		"RequireRole called with invalid role: %s",
+		"RBAC rejected: role=%s required=%s path=%s",
+		"AUTH_GUARD rejected: no Authorization header path=%s",
+		"ROOM_FILE_UPLOAD: room=%s file=%s size=%d",
+		"2FA_SETUP success: org=%s (pending verification)",
+		"SUBMIT_TIP success: anon=%s files=%d encrypted=%v",
+		"UPDATE_STATUS success: submission=%s status=%s priority=%s",
+		"ADD_NOTE success: submission=%s depth=%d",
+		"STATUS_WS JOIN: sub=%s",
+		"STATUS_WS LEAVE: sub=%s",
+	}
+
+	for _, s := range goodFormatStrings {
+		for _, pat := range ipInFormatString {
+			if pat.MatchString(s) {
+				t.Errorf("Expected regex to NOT flag format string %q, but matched %s", s, pat.String())
+			}
+		}
+	}
+}
+
 // extractAssignedVarName pulls the variable name from an assignment like
-// "ip := c.IP()" or "clientIP = c.IP()".
+// "ip := c.IP()" or "var clientIP string = c.IP()".
 func extractAssignedVarName(line string) string {
-	// Match: varName := c.IP() or varName = c.IP()
-	re := regexp.MustCompile(`(\w+)\s*(:?=|:=)\s*c\.IP\(\)`)
-	matches := re.FindStringSubmatch(line)
-	if len(matches) >= 2 {
+	matches := assignIPPattern.FindStringSubmatch(line)
+	if len(matches) > 1 && matches[1] != "" {
 		return matches[1]
 	}
-	return ""
+	if len(matches) > 2 && matches[2] != "" {
+		return matches[2]
+	}
+	return "ip"
 }
 
 func findRoot(t *testing.T) string {

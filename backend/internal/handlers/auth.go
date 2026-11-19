@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -14,10 +15,11 @@ import (
 )
 
 type SignupRequest struct {
-	Name      string `json:"name" validate:"required,min=2,max=255"`
-	Email     string `json:"email" validate:"required,email"`
-	Password  string `json:"password" validate:"required,min=8,max=128"`
-	PublicKey string `json:"public_key"` // NEW: Organization's public key for E2EE
+	Name             string `json:"name" validate:"required,min=2,max=255"`
+	Email            string `json:"email" validate:"required,email"`
+	Password         string `json:"password" validate:"required,min=8,max=128"`
+	PublicKey        string `json:"public_key"`
+	EncryptionScheme string `json:"encryption_scheme"` // "libsodium" | "pgp"
 }
 
 type LoginRequest struct {
@@ -59,6 +61,16 @@ func SignupOrganization(c *fiber.Ctx) error {
 		})
 	}
 
+	scheme := req.EncryptionScheme
+	if scheme == "" {
+		scheme = "libsodium"
+	}
+	if scheme != "libsodium" && scheme != "pgp" {
+		return c.Status(400).JSON(fiber.Map{
+			"error": "Invalid encryption_scheme: must be 'libsodium' or 'pgp'",
+		})
+	}
+
 	// Check if email already exists
 	var existing models.Organization
 	result := models.DB.Where("email = ?", req.Email).First(&existing)
@@ -79,10 +91,11 @@ func SignupOrganization(c *fiber.Ctx) error {
 
 	// Create organization
 	org := models.Organization{
-		Name:         req.Name,
-		Email:        req.Email,
-		PasswordHash: hashedPassword,
-		PublicKey:    req.PublicKey, // NEW
+		Name:             req.Name,
+		Email:            req.Email,
+		PasswordHash:     hashedPassword,
+		PublicKey:        req.PublicKey,
+		EncryptionScheme: scheme,
 	}
 
 	if err := models.DB.Create(&org).Error; err != nil {
@@ -93,16 +106,17 @@ func SignupOrganization(c *fiber.Ctx) error {
 	}
 
 	// Return success with submission URL
-	log.Printf("AUTH_SIGNUP success: org=%s email=%s", org.ID, req.Email)
+	log.Printf("AUTH_SIGNUP success: org=%s email=%s scheme=%s", org.ID, req.Email, scheme)
 	return c.Status(201).JSON(fiber.Map{
 		"message": "Organization created successfully",
 		"organization": fiber.Map{
-			"id":              org.ID,
-			"name":            org.Name,
-			"email":           org.Email,
-			"submission_slug": org.SubmissionSlug,
-			"public_key":      org.PublicKey, // NEW
-			"submission_url":  "/submit/" + org.SubmissionSlug,
+			"id":                org.ID,
+			"name":              org.Name,
+			"email":             org.Email,
+			"submission_slug":   org.SubmissionSlug,
+			"public_key":        org.PublicKey,
+			"encryption_scheme": org.EncryptionScheme,
+			"submission_url":    "/submit/" + org.SubmissionSlug,
 		},
 	})
 }
@@ -160,25 +174,27 @@ func LoginOrganization(c *fiber.Ctx) error {
 		})
 	}
 
-	// No 2FA — issue full session JWT
-	token, err := crypto.GenerateToken(org.ID, org.Email, cfg.JWTSecret)
+	// No 2FA — create stateful session and issue session-backed JWT
+	token, session, err := createSessionAndToken(org.ID, org.Email)
 	if err != nil {
-		log.Printf("AUTH_LOGIN failed: JWT gen error for org=%s: %v", org.ID, err)
+		log.Printf("AUTH_LOGIN failed: session/JWT gen error for org=%s: %v", org.ID, err)
 		return c.Status(500).JSON(fiber.Map{
-			"error": "Failed to generate token",
+			"error": "Failed to generate session",
 		})
 	}
 
-	log.Printf("AUTH_LOGIN success: org=%s", org.ID)
+	log.Printf("AUTH_LOGIN success: org=%s session=%s", org.ID, session.ID)
 	return c.Status(200).JSON(fiber.Map{
 		"message": "Login successful",
 		"token":   token,
 		"organization": fiber.Map{
-			"id":              org.ID,
-			"name":            org.Name,
-			"email":           org.Email,
-			"submission_slug": org.SubmissionSlug,
-			"totp_enabled":    org.TOTPEnabled,
+			"id":                org.ID,
+			"name":              org.Name,
+			"email":             org.Email,
+			"submission_slug":   org.SubmissionSlug,
+			"totp_enabled":      org.TOTPEnabled,
+			"encryption_scheme": org.EncryptionScheme,
+			"public_key":        org.PublicKey,
 		},
 	})
 }
@@ -209,7 +225,7 @@ func Login2FA(c *fiber.Ctx) error {
 	// Validate the pending token
 	claims, err := crypto.ValidatePendingToken(req.PendingToken, cfg.JWTSecret)
 	if err != nil {
-		log.Printf("AUTH_2FA rejected: invalid pending token")
+		log.Printf("AUTH_2FA rejected: invalid pending token: %v", err)
 		return c.Status(401).JSON(fiber.Map{
 			"error": "Invalid credentials",
 		})
@@ -245,28 +261,168 @@ func Login2FA(c *fiber.Ctx) error {
 		})
 	}
 
-	// Issue the real session JWT
-	token, err := crypto.GenerateToken(org.ID, org.Email, cfg.JWTSecret)
+	// Issue the stateful session JWT
+	token, session, err := createSessionAndToken(org.ID, org.Email)
 	if err != nil {
-		log.Printf("AUTH_2FA failed: JWT gen error for org=%s: %v", orgID, err)
+		log.Printf("AUTH_2FA failed: session/JWT gen error for org=%s: %v", orgID, err)
 		return c.Status(500).JSON(fiber.Map{
-			"error": "Failed to generate token",
+			"error": "Failed to generate session",
 		})
 	}
 
-	log.Printf("AUTH_2FA success: org=%s", orgID)
+	log.Printf("AUTH_2FA success: org=%s session=%s", orgID, session.ID)
 	return c.Status(200).JSON(fiber.Map{
 		"message": "Login successful",
 		"token":   token,
 		"organization": fiber.Map{
-			"id":              org.ID,
-			"name":            org.Name,
-			"email":           org.Email,
-			"submission_slug": org.SubmissionSlug,
-			"totp_enabled":    org.TOTPEnabled,
+			"id":                org.ID,
+			"name":              org.Name,
+			"email":             org.Email,
+			"submission_slug":   org.SubmissionSlug,
+			"totp_enabled":      org.TOTPEnabled,
+			"encryption_scheme": org.EncryptionScheme,
+			"public_key":        org.PublicKey,
 		},
 	})
-} // GetOrganization returns organization details (placeholder for now)
+}
+
+// createSessionAndToken provision a database-backed session and returns the signed JWT
+func createSessionAndToken(orgID uuid.UUID, email string) (string, *models.Session, error) {
+	cfg := config.AppConfig
+	sessionID := uuid.New()
+	token, err := crypto.GenerateTokenWithSession(orgID, email, sessionID, cfg.JWTSecret)
+	if err != nil {
+		return "", nil, err
+	}
+
+	tokenHash := crypto.HashToken(token)
+	now := time.Now()
+	session := models.Session{
+		ID:             sessionID,
+		OrganizationID: orgID,
+		TokenHash:      tokenHash,
+		CreatedAt:      now,
+		LastSeenAt:     now,
+		ExpiresAt:      now.Add(24 * time.Hour),
+	}
+
+	if err := models.DB.Create(&session).Error; err != nil {
+		return "", nil, err
+	}
+
+	return token, &session, nil
+}
+
+// ListActiveSessions returns all valid active sessions for the authenticated organization
+func ListActiveSessions(c *fiber.Ctx) error {
+	orgID := c.Locals("orgID").(string)
+	currentSessionID, _ := c.Locals("sessionID").(string)
+
+	var sessions []models.Session
+	now := time.Now()
+	if err := models.DB.Where("organization_id = ? AND expires_at > ?", orgID, now).
+		Order("created_at desc").
+		Find(&sessions).Error; err != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"error": "Failed to retrieve sessions",
+		})
+	}
+
+	type SessionResponse struct {
+		ID         uuid.UUID `json:"id"`
+		CreatedAt  time.Time `json:"created_at"`
+		LastSeenAt time.Time `json:"last_seen_at"`
+		ExpiresAt  time.Time `json:"expires_at"`
+		IsCurrent  bool      `json:"is_current"`
+	}
+
+	result := make([]SessionResponse, len(sessions))
+	for i, s := range sessions {
+		result[i] = SessionResponse{
+			ID:         s.ID,
+			CreatedAt:  s.CreatedAt,
+			LastSeenAt: s.LastSeenAt,
+			ExpiresAt:  s.ExpiresAt,
+			IsCurrent:  s.ID.String() == currentSessionID,
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"sessions": result,
+	})
+}
+
+// RevokeSession deletes a specific session by ID for the organization
+func RevokeSession(c *fiber.Ctx) error {
+	orgID := c.Locals("orgID").(string)
+	sessionID := c.Params("id")
+
+	targetUUID, err := uuid.Parse(sessionID)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{
+			"error": "Invalid session ID format",
+		})
+	}
+
+	res := models.DB.Where("id = ? AND organization_id = ?", targetUUID, orgID).Delete(&models.Session{})
+	if res.Error != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"error": "Failed to revoke session",
+		})
+	}
+
+	if res.RowsAffected == 0 {
+		return c.Status(404).JSON(fiber.Map{
+			"error": "Session not found",
+		})
+	}
+
+	log.Printf("SESSION_REVOKE success: session=%s org=%s", sessionID, orgID)
+	return c.JSON(fiber.Map{
+		"message": "Session revoked successfully",
+	})
+}
+
+// RevokeAllOtherSessions deletes all active sessions for the org except the caller's active session
+func RevokeAllOtherSessions(c *fiber.Ctx) error {
+	orgID := c.Locals("orgID").(string)
+	currentSessionID, _ := c.Locals("sessionID").(string)
+
+	currentUUID, err := uuid.Parse(currentSessionID)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{
+			"error": "Invalid current session",
+		})
+	}
+
+	res := models.DB.Where("organization_id = ? AND id != ?", orgID, currentUUID).Delete(&models.Session{})
+	if res.Error != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"error": "Failed to revoke other sessions",
+		})
+	}
+
+	log.Printf("SESSION_REVOKE_ALL success: org=%s revoked_count=%d preserved_current=%s", orgID, res.RowsAffected, currentSessionID)
+	return c.JSON(fiber.Map{
+		"message":       "All other sessions revoked successfully",
+		"revoked_count": res.RowsAffected,
+	})
+}
+
+// LogoutOrganization immediately revokes the current session
+func LogoutOrganization(c *fiber.Ctx) error {
+	currentSessionID, ok := c.Locals("sessionID").(string)
+	if ok && currentSessionID != "" {
+		models.DB.Where("id = ?", currentSessionID).Delete(&models.Session{})
+		log.Printf("AUTH_LOGOUT success: session=%s", currentSessionID)
+	}
+
+	return c.JSON(fiber.Map{
+		"message": "Logged out successfully",
+	})
+}
+
+// GetOrganization returns organization details (placeholder for now)
 func GetOrganization(c *fiber.Ctx) error {
 	id := c.Params("id")
 
@@ -291,12 +447,11 @@ func GetOrganization(c *fiber.Ctx) error {
 }
 
 type RotateKeyRequest struct {
-	PublicKey string `json:"public_key"`
+	PublicKey        string `json:"public_key"`
+	EncryptionScheme string `json:"encryption_scheme,omitempty"`
 }
 
-// RotatePublicKey updates the organization's public key. The caller is
-// responsible for re-encrypting any existing submissions client-side —
-// the server only stores the new key.
+// RotatePublicKey updates the organization's public key and optionally its scheme.
 func RotatePublicKey(c *fiber.Ctx) error {
 	orgID := c.Locals("orgID").(string)
 
@@ -313,16 +468,28 @@ func RotatePublicKey(c *fiber.Ctx) error {
 		})
 	}
 
+	updates := map[string]interface{}{
+		"public_key": req.PublicKey,
+	}
+	if req.EncryptionScheme != "" {
+		if req.EncryptionScheme != "libsodium" && req.EncryptionScheme != "pgp" {
+			return c.Status(400).JSON(fiber.Map{
+				"error": "Invalid encryption_scheme: must be 'libsodium' or 'pgp'",
+			})
+		}
+		updates["encryption_scheme"] = req.EncryptionScheme
+	}
+
 	if err := models.DB.Model(&models.Organization{}).
 		Where("id = ?", orgID).
-		Update("public_key", req.PublicKey).Error; err != nil {
+		Updates(updates).Error; err != nil {
 		log.Printf("KEY_ROTATE failed: DB update error for org=%s: %v", orgID, err)
 		return c.Status(500).JSON(fiber.Map{
 			"error": "Failed to update public key",
 		})
 	}
 
-	log.Printf("KEY_ROTATE success: org=%s", orgID)
+	log.Printf("KEY_ROTATE success: org=%s scheme=%v", orgID, req.EncryptionScheme)
 	return c.JSON(fiber.Map{
 		"message": "Public key updated successfully. Remember to re-encrypt existing submissions client-side.",
 	})
@@ -351,11 +518,11 @@ func GetDeadMansSwitch(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"enabled":      dms.Enabled,
-		"trigger_days": dms.TriggerDays,
-		"action_type":  dms.ActionType,
+		"enabled":       dms.Enabled,
+		"trigger_days":  dms.TriggerDays,
+		"action_type":   dms.ActionType,
 		"last_login_at": dms.LastLoginAt,
-		"triggered_at": dms.TriggeredAt,
+		"triggered_at":  dms.TriggeredAt,
 	})
 }
 
@@ -495,16 +662,63 @@ func CheckDeadManSwitches() {
 		log.Printf("DMS_TRIGGER: org=%s days_since_login=%d action=%s", org.ID, daysSinceLogin, dms.ActionType)
 
 		switch dms.ActionType {
+		case "publish":
+			publishDMSTriggerStatement(org, daysSinceLogin)
 		case "email":
 			go SendDMSTriggerEmail(org, daysSinceLogin)
-		case "publish":
-			appendDMSPublishLog(org.ID.String(), daysSinceLogin)
 		case "delete":
-			log.Printf("DMS_TRIGGER delete: TODO — org=%s; destructive action not implemented", org.ID)
+			var subs []models.Submission
+			models.DB.Where("organization_id = ?", org.ID).Find(&subs)
+			for _, sub := range subs {
+				var files []models.SubmissionFile
+				models.DB.Where("submission_id = ?", sub.ID).Find(&files)
+				for _, f := range files {
+					os.Remove("uploads/" + f.StorageKey)
+				}
+				models.DB.Where("submission_id = ?", sub.ID).Delete(&models.SubmissionFile{})
+				models.DB.Where("submission_id = ?", sub.ID).Delete(&models.Reply{})
+				models.DB.Where("submission_id = ?", sub.ID).Delete(&models.SubmissionMessage{})
+				models.DB.Where("submission_id = ?", sub.ID).Delete(&models.InternalNote{})
+				models.DB.Where("submission_id = ?", sub.ID).Delete(&models.Activity{})
+				models.DB.Delete(&sub)
+			}
+			log.Printf("DMS_TRIGGER delete: successfully wiped %d submissions and files for org=%s", len(subs), org.ID)
+		default:
+			log.Printf("DMS_TRIGGER unknown action: %s for org=%s", dms.ActionType, org.ID)
 		}
 
 		// Mark as triggered
 		models.DB.Model(&dms).Update("triggered_at", now)
+	}
+}
+
+// publishDMSTriggerStatement updates the warrant canary transparency record
+// to publish the emergency notice when an organization's dead man's switch triggers.
+func publishDMSTriggerStatement(org models.Organization, daysSinceLogin int) {
+	triggerTime := time.Now().UTC().Format(time.RFC3339)
+	entry := fmt.Sprintf("\n\n## ⚠️ Dead Man's Switch Triggered Alert\n\n- **Organization:** %s\n- **Organization ID:** `%s`\n- **Triggered Timestamp:** %s\n- **Inactivity Period:** %d days without login\n- **Notice:** The dead man's switch for this organization was triggered automatically due to lack of administrative check-in beyond the configured threshold.\n",
+		org.Name, org.ID.String(), triggerTime, daysSinceLogin)
+
+	canaryPaths := []string{"docs/WARRANT_CANARY.md", "../docs/WARRANT_CANARY.md"}
+	canaryUpdated := false
+	for _, path := range canaryPaths {
+		if _, err := os.Stat(path); err == nil {
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+			if err == nil {
+				if _, err := f.WriteString(entry); err == nil {
+					canaryUpdated = true
+				}
+				f.Close()
+			}
+		}
+	}
+
+	appendDMSPublishLog(org.ID.String(), daysSinceLogin)
+
+	if canaryUpdated {
+		log.Printf("DMS_PUBLISH success: published alert to warrant canary for org=%s", org.ID)
+	} else {
+		log.Printf("DMS_PUBLISH: updated DMS_RELEASED.md log for org=%s", org.ID)
 	}
 }
 
@@ -515,20 +729,21 @@ func CheckDeadManSwitches() {
 // SECURITY: Only the org ID and trigger timestamp are recorded. No submission
 // content or encrypted data is included — the server cannot decrypt it.
 func appendDMSPublishLog(orgID string, daysSinceLogin int) {
-	logPath := "docs/DMS_RELEASED.md"
+	logPaths := []string{"docs/DMS_RELEASED.md", "../docs/DMS_RELEASED.md"}
 	entry := fmt.Sprintf("- Org `%s` — DMS triggered on %s (%d days since last login)\n",
 		orgID, time.Now().UTC().Format(time.RFC3339), daysSinceLogin)
 
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("DMS_PUBLISH failed: could not open %s: %v", logPath, err)
-		return
+	for _, logPath := range logPaths {
+		dir := filepath.Dir(logPath)
+		if _, err := os.Stat(dir); err == nil {
+			f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err == nil {
+				f.WriteString(entry)
+				f.Close()
+				log.Printf("DMS_PUBLISH appended: org=%s to=%s", orgID, logPath)
+				return
+			}
+		}
 	}
-	defer f.Close()
-
-	if _, err := f.WriteString(entry); err != nil {
-		log.Printf("DMS_PUBLISH failed: write error: %v", err)
-		return
-	}
-	log.Printf("DMS_PUBLISH appended: org=%s to=%s", orgID, logPath)
+	log.Printf("DMS_PUBLISH notice: org=%s triggered (%d days since login)", orgID, daysSinceLogin)
 }

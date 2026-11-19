@@ -97,12 +97,12 @@ func UploadRoomFile(c *fiber.Ctx) error {
 	log.Printf("ROOM_FILE_UPLOAD: room=%s file=%s size=%d", code, roomFile.ID.String(), fileHeader.Size)
 
 	return c.Status(201).JSON(fiber.Map{
-		"file_id":      roomFile.ID.String(),
+		"file_id":       roomFile.ID.String(),
 		"original_name": originalName,
-		"mime_type":    mimeType,
-		"file_size":    fileHeader.Size,
-		"sender_tag":   senderTag,
-		"created_at":   roomFile.CreatedAt.Format(time.RFC3339),
+		"mime_type":     mimeType,
+		"file_size":     fileHeader.Size,
+		"sender_tag":    senderTag,
+		"created_at":    roomFile.CreatedAt.Format(time.RFC3339),
 	})
 }
 

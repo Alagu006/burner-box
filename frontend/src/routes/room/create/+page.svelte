@@ -57,6 +57,14 @@
 
       roomCode = data.room_code;
 
+      if (data.creator_token) {
+        try {
+          sessionStorage.setItem('bb_creator_token_' + data.room_code, data.creator_token);
+        } catch (e) {
+          console.warn('Unable to persist creator token in sessionStorage', e);
+        }
+      }
+
       // Build share URL with encryption key in the fragment
       // Fragment is NEVER sent to the server
       const base = window.location.origin + '/room/' + roomCode;

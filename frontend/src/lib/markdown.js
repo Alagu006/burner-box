@@ -21,11 +21,50 @@ marked.setOptions({
   gfm: true,         // GitHub Flavored Markdown
 });
 
-// Strip ALL HTML tags from a string — primary XSS defense
-function stripAllHtml(html) {
-  // Remove anything that looks like a tag, including attributes
-  // This catches <script>, <img onerror=...>, <a href="javascript:...">, etc.
-  return html.replace(/<[^>]*>/g, '');
+const ALLOWED_TAGS = new Set([
+  'strong', 'em', 'p', 'br',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'ul', 'ol', 'li', 'a',
+  'code', 'pre', 'blockquote', 'hr'
+]);
+
+// Sanitize HTML by removing any tag not in ALLOWED_TAGS and stripping
+// all attributes except safe http:// / https:// href on <a> tags.
+export function sanitizeHtml(html) {
+  if (!html) return '';
+
+  return html.replace(/<\/?([a-zA-Z0-9]+)(?:\s+[^>]*)?\/?>/g, (match, tagName) => {
+    const tag = tagName.toLowerCase();
+    if (!ALLOWED_TAGS.has(tag)) {
+      return ''; // Strip non-allowed tags completely
+    }
+
+    const isClosing = match.startsWith('</');
+    if (isClosing) {
+      return `</${tag}>`;
+    }
+
+    if (tag === 'br' || tag === 'hr') {
+      return `<${tag}>`;
+    }
+
+    if (tag === 'a') {
+      // Extract href attribute
+      const hrefMatch = match.match(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+      const rawHref = hrefMatch ? (hrefMatch[1] || hrefMatch[2] || hrefMatch[3] || '').trim() : '';
+
+      // Validate that href starts with http:// or https://
+      if (/^https?:\/\//i.test(rawHref)) {
+        const safeHref = rawHref.replace(/"/g, '&quot;');
+        return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">`;
+      }
+      // If href is not safe http/https, render without href
+      return '<a>';
+    }
+
+    // Strip all attributes for all other allowed tags
+    return `<${tag}>`;
+  });
 }
 
 // Render markdown to safe HTML
@@ -35,17 +74,8 @@ export function renderMarkdown(text) {
   // Step 1: Parse markdown to HTML
   const rawHtml = marked.parse(text);
 
-  // Step 2: Strip ALL HTML tags — this is the safety net
-  const safeHtml = stripAllHtml(rawHtml);
-
-  // Step 3: Decode common HTML entities back to readable characters
-  // (marked may encode these during parsing)
-  return safeHtml
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+  // Step 2: Sanitize HTML against allowed safe tags and attributes
+  return sanitizeHtml(rawHtml);
 }
 
 // Simple markdown preview (first N chars, stripped of formatting)

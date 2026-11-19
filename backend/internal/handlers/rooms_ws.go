@@ -3,7 +3,9 @@ package handlers
 import (
 	"burner-box-backend/internal/crypto"
 	"burner-box-backend/internal/models"
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"math"
 	"sync"
@@ -17,44 +19,189 @@ import (
 // ---- WebSocket hub per room ----
 
 type wsClient struct {
-	conn   *websocket.Conn
-	room   string
-	send   chan []byte
-	kill   chan struct{}
+	conn *websocket.Conn
+	room string
+	send chan []byte
+	kill chan struct{}
 }
 
 type wsHub struct {
+	roomID     uuid.UUID
+	roomCode   string
 	clients    map[*wsClient]struct{}
 	broadcast  chan []byte
 	register   chan *wsClient
 	unregister chan *wsClient
 	mu         sync.Mutex
-	roomCode   string
+	destroyed  bool
+}
+
+type roomTombstone struct {
+	roomID      uuid.UUID
+	destroyedAt time.Time
 }
 
 var (
-	roomHubs   = make(map[string]*wsHub)
-	roomHubsMu sync.Mutex
+	roomHubs       = make(map[string]*wsHub)
+	destroyedRooms = make(map[string]roomTombstone)
+	roomHubsMu     sync.RWMutex
 )
 
-func getOrCreateHub(roomCode string) *wsHub {
+const (
+	MaxJoinHandshakeDuration = 15 * time.Second
+	tombstoneTTL             = 10 * time.Minute
+)
+
+// registerClientAtomic performs atomic client registration following L1 (roomHubsMu) -> L2 (hub.mu)
+func registerClientAtomic(
+	roomCode string,
+	roomID uuid.UUID,
+	client *wsClient,
+	maxParticipants int,
+	ctx context.Context,
+) (*wsHub, error) {
+	// 1. Pre-lock context assertion: abort early if join handshake already expired
+	if err := ctx.Err(); err != nil {
+		return nil, errors.New("join handshake timed out before lock acquisition")
+	}
+
+	// 2. Acquire Level 1 Lock: roomHubsMu
 	roomHubsMu.Lock()
 	defer roomHubsMu.Unlock()
 
-	if hub, ok := roomHubs[roomCode]; ok {
-		return hub
+	// 3. Reject if the room generation has been tombstoned
+	if ts, isDestroyed := destroyedRooms[roomCode]; isDestroyed {
+		if ts.roomID == roomID {
+			return nil, errors.New("room has been destroyed")
+		}
 	}
 
-	hub := &wsHub{
-		clients:    make(map[*wsClient]struct{}),
-		broadcast:  make(chan []byte, 256),
-		register:   make(chan *wsClient),
-		unregister: make(chan *wsClient),
-		roomCode:   roomCode,
+	// 4. Branch based on existing hub vs new candidate hub
+	hub, exists := roomHubs[roomCode]
+	isNewHub := false
+
+	if !exists {
+		// Construct candidate hub locally in heap memory.
+		// DO NOT publish to roomHubs map yet.
+		// DO NOT spawn hub.run() goroutine yet.
+		hub = &wsHub{
+			roomID:     roomID,
+			roomCode:   roomCode,
+			clients:    make(map[*wsClient]struct{}),
+			broadcast:  make(chan []byte, 256),
+			register:   make(chan *wsClient),
+			unregister: make(chan *wsClient, 64),
+			destroyed:  false,
+		}
+		isNewHub = true
 	}
-	roomHubs[roomCode] = hub
-	go hub.run()
-	return hub
+
+	// 5. Acquire Level 2 Lock: hub.mu while holding roomHubsMu (strictly preserving L1 -> L2)
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+
+	// 6. If existing hub, perform state and generation identity validations
+	if !isNewHub {
+		if hub.destroyed {
+			return nil, errors.New("room hub has been destroyed")
+		}
+		if hub.roomID != roomID {
+			return nil, errors.New("room generation mismatch")
+		}
+		if len(hub.clients) >= maxParticipants {
+			return nil, errors.New("room is full")
+		}
+	}
+
+	// 7. Perform final context expiration check immediately before insertion
+	if err := ctx.Err(); err != nil {
+		return nil, errors.New("join request expired before registration")
+	}
+
+	// 8. Register the client atomically under both locks
+	hub.clients[client] = struct{}{}
+
+	// 9. If candidate hub, publish to registry and spawn worker now that registration succeeded
+	if isNewHub {
+		roomHubs[roomCode] = hub
+		go hub.run()
+	}
+
+	// 10. Locks released in reverse order (hub.mu then roomHubsMu) via defers
+	return hub, nil
+}
+
+// CloseRoomHubAtomic severs all WebSocket connections for a room generation under L1 -> L2 locks
+func CloseRoomHubAtomic(roomCode string, roomID uuid.UUID, reason string) {
+	var clientsToClose []*wsClient
+
+	// 1. Acquire Level 1 Lock: roomHubsMu
+	roomHubsMu.Lock()
+
+	hub, exists := roomHubs[roomCode]
+	shouldDestroy := false
+
+	if exists && hub != nil {
+		// GENERATION SAFETY CHECK:
+		// Only remove from map and destroy if hub matches the targeted roomID generation!
+		// If hub.roomID != roomID, a newer room generation has reused roomCode.
+		// A stale invalidation event for an old room UUID must NEVER destroy a newer room!
+		if hub.roomID == roomID {
+			delete(roomHubs, roomCode)
+			shouldDestroy = true
+		} else {
+			// Stale invalidation event: harmless NO-OP
+			roomHubsMu.Unlock()
+			return
+		}
+	}
+
+	// Record generation tombstone
+	destroyedRooms[roomCode] = roomTombstone{
+		roomID:      roomID,
+		destroyedAt: time.Now(),
+	}
+
+	if shouldDestroy {
+		// 2. Acquire Level 2 Lock: hub.mu
+		hub.mu.Lock()
+
+		// Mark destroyed under lock
+		hub.destroyed = true
+
+		// Drain clients into local slice
+		clientsToClose = make([]*wsClient, 0, len(hub.clients))
+		for client := range hub.clients {
+			clientsToClose = append(clientsToClose, client)
+			delete(hub.clients, client)
+		}
+
+		// Release hub.mu
+		hub.mu.Unlock()
+	}
+
+	// Release roomHubsMu
+	roomHubsMu.Unlock()
+
+	// Clean up revival proposals outside locks
+	removeRevivalProposalsForRoom(roomCode)
+
+	// 3. Network I/O outside all locks
+	if len(clientsToClose) > 0 {
+		outBytes, _ := json.Marshal(map[string]interface{}{
+			"type":    "room_destroyed",
+			"payload": reason,
+		})
+		for _, client := range clientsToClose {
+			select {
+			case client.send <- outBytes:
+			default:
+			}
+			if client.conn != nil {
+				client.conn.Close()
+			}
+		}
+	}
 }
 
 func (h *wsHub) run() {
@@ -62,7 +209,9 @@ func (h *wsHub) run() {
 		select {
 		case client := <-h.register:
 			h.mu.Lock()
-			h.clients[client] = struct{}{}
+			if !h.destroyed {
+				h.clients[client] = struct{}{}
+			}
 			h.mu.Unlock()
 
 		case client := <-h.unregister:
@@ -71,12 +220,12 @@ func (h *wsHub) run() {
 				delete(h.clients, client)
 				close(client.send)
 			}
-			h.mu.Unlock()
 			// Clean up empty hubs
-			h.mu.Lock()
 			if len(h.clients) == 0 {
 				roomHubsMu.Lock()
-				delete(roomHubs, h.roomCode)
+				if currentHub, ok := roomHubs[h.roomCode]; ok && currentHub == h {
+					delete(roomHubs, h.roomCode)
+				}
 				roomHubsMu.Unlock()
 				h.mu.Unlock()
 				return
@@ -126,9 +275,9 @@ func (h *wsHub) clientCount() int {
 func (h *wsHub) broadcastParticipantCount(maxParticipants int) {
 	count := h.clientCount()
 	out := map[string]interface{}{
-		"type":           "participant_count",
-		"count":          count,
-		"max":            maxParticipants,
+		"type":             "participant_count",
+		"count":            count,
+		"max":              maxParticipants,
 		"participant_text": formatParticipantText(count, maxParticipants),
 	}
 	outBytes, _ := json.Marshal(out)
@@ -160,11 +309,11 @@ func itoa(n int) string {
 // ---- Room revival proposal tracking (in-memory) ----
 
 type revivalProposal struct {
-	ProposalID string    `json:"proposal_id"`
-	RoomCode   string    `json:"room_code"`
-	ProposedBy string    `json:"proposed_by"` // sender_tag
-	Confirmed  map[string]bool `json:"-"`     // sender_tag -> confirmed
-	CreatedAt  time.Time `json:"created_at"`
+	ProposalID string          `json:"proposal_id"`
+	RoomCode   string          `json:"room_code"`
+	ProposedBy string          `json:"proposed_by"` // sender_tag
+	Confirmed  map[string]bool `json:"-"`           // sender_tag -> confirmed
+	CreatedAt  time.Time       `json:"created_at"`
 }
 
 var (
@@ -198,6 +347,16 @@ func removeRevivalProposal(id string) {
 	revivalProposalsMu.Lock()
 	delete(revivalProposals, id)
 	revivalProposalsMu.Unlock()
+}
+
+func removeRevivalProposalsForRoom(roomCode string) {
+	revivalProposalsMu.Lock()
+	defer revivalProposalsMu.Unlock()
+	for id, p := range revivalProposals {
+		if p.RoomCode == roomCode {
+			delete(revivalProposals, id)
+		}
+	}
 }
 
 func generateProposalID() string {
@@ -254,6 +413,9 @@ type wsRoomMessage struct {
 // ---- JoinRoom WebSocket endpoint ----
 
 func JoinRoom(c *websocket.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), MaxJoinHandshakeDuration)
+	defer cancel()
+
 	code := c.Params("code")
 	if code == "" {
 		c.WriteJSON(fiber.Map{"type": "error", "payload": "Room code required"})
@@ -294,34 +456,28 @@ func JoinRoom(c *websocket.Conn) {
 	// Generate anonymous sender tag
 	senderTag := models.GenerateSenderTag()
 
-	// Enforce MaxParticipants
-	hub := getOrCreateHub(code)
-	hub.mu.Lock()
-	participantCount := len(hub.clients)
-	hub.mu.Unlock()
-
-	if participantCount >= room.MaxParticipants {
-		c.WriteJSON(fiber.Map{"type": "error", "payload": "Room is full"})
-		c.Close()
-		return
-	}
-
-	// Register client
+	// Register client atomically under strict L1 -> L2 locks
 	client := &wsClient{
 		conn: c,
 		room: code,
 		send: make(chan []byte, 256),
 		kill: make(chan struct{}),
 	}
-	hub.register <- client
+
+	hub, err := registerClientAtomic(code, room.ID, client, room.MaxParticipants, ctx)
+	if err != nil {
+		c.WriteJSON(fiber.Map{"type": "error", "payload": err.Error()})
+		c.Close()
+		return
+	}
 	log.Printf("ROOM_WS JOIN: room=%s tag=%s", code, senderTag)
 
 	// Send join confirmation with sender tag and expiry info
 	c.WriteJSON(fiber.Map{
-		"type":        "system",
-		"payload":     "You joined as " + senderTag,
-		"sender_tag":  senderTag,
-		"expires_at":  room.ExpiresAt.Format(time.RFC3339),
+		"type":             "system",
+		"payload":          "You joined as " + senderTag,
+		"sender_tag":       senderTag,
+		"expires_at":       room.ExpiresAt.Format(time.RFC3339),
 		"max_participants": room.MaxParticipants,
 	})
 
@@ -512,12 +668,12 @@ func JoinRoom(c *websocket.Conn) {
 			currentCount := hub.clientCount()
 
 			out := map[string]interface{}{
-				"type":         "revival_proposal",
-				"proposal_id":  proposal.ProposalID,
-				"proposed_by":  senderTag,
+				"type":          "revival_proposal",
+				"proposal_id":   proposal.ProposalID,
+				"proposed_by":   senderTag,
 				"confirmations": 1,
-				"required":     int(math.Ceil(float64(currentCount) / 2.0)),
-				"total":        currentCount,
+				"required":      int(math.Ceil(float64(currentCount) / 2.0)),
+				"total":         currentCount,
 			}
 			outBytes, _ := json.Marshal(out)
 			hub.broadcast <- outBytes
@@ -556,10 +712,10 @@ func JoinRoom(c *websocket.Conn) {
 					models.DB.Model(&r).Update("expires_at", newExpiry)
 
 					out := map[string]interface{}{
-						"type":        "revival_result",
-						"proposal_id": confirmMsg.ProposalID,
-						"accepted":    true,
-						"new_expires": newExpiry.Format(time.RFC3339),
+						"type":          "revival_result",
+						"proposal_id":   confirmMsg.ProposalID,
+						"accepted":      true,
+						"new_expires":   newExpiry.Format(time.RFC3339),
 						"confirmations": confirmations,
 					}
 					outBytes, _ := json.Marshal(out)
@@ -570,13 +726,13 @@ func JoinRoom(c *websocket.Conn) {
 			} else {
 				// Broadcast updated confirmation count
 				out := map[string]interface{}{
-					"type":         "revival_proposal",
-					"proposal_id":  confirmMsg.ProposalID,
-					"proposed_by":  proposal.ProposedBy,
+					"type":          "revival_proposal",
+					"proposal_id":   confirmMsg.ProposalID,
+					"proposed_by":   proposal.ProposedBy,
 					"confirmations": confirmations,
-					"required":     required,
-					"total":        currentCount,
-					"confirmed_by": senderTag,
+					"required":      required,
+					"total":         currentCount,
+					"confirmed_by":  senderTag,
 				}
 				outBytes, _ := json.Marshal(out)
 				hub.broadcast <- outBytes
@@ -644,9 +800,100 @@ func JoinRoom(c *websocket.Conn) {
 
 	// Cleanup when read loop exits (client disconnected or error)
 	log.Printf("ROOM_WS LEAVE: room=%s tag=%s", code, senderTag)
-	hub.unregister <- client
+	select {
+	case hub.unregister <- client:
+	default:
+	}
 	hub.broadcastParticipantCount(room.MaxParticipants)
 	c.Close()
+}
+
+func startTombstoneJanitor(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Minute)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				roomHubsMu.Lock()
+				now := time.Now()
+				for code, ts := range destroyedRooms {
+					if now.Sub(ts.destroyedAt) > tombstoneTTL {
+						delete(destroyedRooms, code)
+					}
+				}
+				roomHubsMu.Unlock()
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+func reconcileActiveRoomHubs() {
+	roomHubsMu.RLock()
+	if len(roomHubs) == 0 {
+		roomHubsMu.RUnlock()
+		return
+	}
+	type hubSnapshot struct {
+		code string
+		id   uuid.UUID
+	}
+	snapshots := make([]hubSnapshot, 0, len(roomHubs))
+	codes := make([]string, 0, len(roomHubs))
+	for code, hub := range roomHubs {
+		if hub != nil {
+			snapshots = append(snapshots, hubSnapshot{code: code, id: hub.roomID})
+			codes = append(codes, code)
+		}
+	}
+	roomHubsMu.RUnlock()
+
+	var existingRooms []struct {
+		RoomCode string    `gorm:"column:room_code"`
+		ID       uuid.UUID `gorm:"column:id"`
+	}
+	err := models.DB.Table("rooms").Select("room_code, id").Where("room_code IN ?", codes).Scan(&existingRooms).Error
+	if err != nil {
+		log.Printf("[RECONCILER] Query error during reconciliation: %v. Aborting pass.", err)
+		return
+	}
+
+	activeMap := make(map[string]uuid.UUID, len(existingRooms))
+	for _, r := range existingRooms {
+		activeMap[r.RoomCode] = r.ID
+	}
+
+	for _, snap := range snapshots {
+		dbID, exists := activeMap[snap.code]
+		if !exists || dbID != snap.id {
+			log.Printf("[RECONCILER] Room %s (ID %s) not found in DB. Closing hub.", snap.code, snap.id)
+			CloseRoomHubAtomic(snap.code, snap.id, "reconcile")
+		}
+	}
+}
+
+func startRoomReconciler(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				reconcileActiveRoomHubs()
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+// StartRoomLifecycleWorkers starts the background tombstone janitor and reconciler
+func StartRoomLifecycleWorkers() {
+	ctx := context.Background()
+	startTombstoneJanitor(ctx)
+	startRoomReconciler(ctx)
 }
 
 // GetRecentRoomMessages returns recent messages for a room (REST fallback)

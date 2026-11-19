@@ -1,6 +1,8 @@
 package crypto
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -11,15 +13,24 @@ import (
 type JWTClaims struct {
 	OrganizationID string `json:"org_id"`
 	Email          string `json:"email"`
+	SessionID      string `json:"session_id,omitempty"`
 	Pending2FA     bool   `json:"pending_2fa,omitempty"`
 	jwt.RegisteredClaims
 }
 
-// GenerateToken creates a full session JWT for an organization
-func GenerateToken(orgID uuid.UUID, email string, secret string) (string, error) {
+// HashToken calculates the SHA-256 hex string of a raw JWT token
+// Storing only the hash prevents raw token exposure in the database.
+func HashToken(tokenString string) string {
+	h := sha256.Sum256([]byte(tokenString))
+	return hex.EncodeToString(h[:])
+}
+
+// GenerateTokenWithSession creates a full session JWT embedding a specific session ID
+func GenerateTokenWithSession(orgID uuid.UUID, email string, sessionID uuid.UUID, secret string) (string, error) {
 	claims := JWTClaims{
 		OrganizationID: orgID.String(),
 		Email:          email,
+		SessionID:      sessionID.String(),
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -31,6 +42,11 @@ func GenerateToken(orgID uuid.UUID, email string, secret string) (string, error)
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(secret))
+}
+
+// GenerateToken creates a full session JWT for an organization
+func GenerateToken(orgID uuid.UUID, email string, secret string) (string, error) {
+	return GenerateTokenWithSession(orgID, email, uuid.New(), secret)
 }
 
 // GeneratePendingToken creates a short-lived scoped token for 2FA verification

@@ -12,16 +12,19 @@ import (
 
 // Organization represents a registered organization
 type Organization struct {
-	ID             uuid.UUID    `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	Name           string       `gorm:"size:255;not null" json:"name"`
-	Email          string       `gorm:"size:255;uniqueIndex;not null" json:"email"`
-	PasswordHash   string       `gorm:"not null" json:"-"`
-	PublicKey      string       `gorm:"type:text" json:"public_key"` // Organization's public key for E2EE
-	SubmissionSlug string       `gorm:"size:64;uniqueIndex;not null" json:"submission_slug"`
-	WelcomeMessage string       `gorm:"size:1000" json:"welcome_message"`
-	IsVerified     bool         `gorm:"default:false" json:"is_verified"`
-	TOTPSecret     string       `gorm:"size:255" json:"-"`
-	TOTPEnabled    bool         `gorm:"default:false" json:"totp_enabled"`
+	ID                 uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	Name               string     `gorm:"size:255;not null" json:"name"`
+	Email              string     `gorm:"size:255;uniqueIndex;not null" json:"email"`
+	PasswordHash       string     `gorm:"not null" json:"-"`
+	PublicKey          string     `gorm:"type:text" json:"public_key"`                          // Organization's public key for E2EE
+	EncryptionScheme   string     `gorm:"size:20;default:'libsodium'" json:"encryption_scheme"` // "libsodium" | "pgp"
+	SubmissionSlug     string     `gorm:"size:64;uniqueIndex;not null" json:"submission_slug"`
+	WelcomeMessage     string     `gorm:"size:1000" json:"welcome_message"`
+	LogoURL            string     `gorm:"size:2048" json:"logo_url,omitempty"`
+	CustomFields       string     `gorm:"type:text" json:"custom_fields,omitempty"` // JSON array of custom fields configuration
+	IsVerified         bool       `gorm:"default:false" json:"is_verified"`
+	TOTPSecret         string     `gorm:"size:255" json:"-"`
+	TOTPEnabled        bool       `gorm:"default:false" json:"totp_enabled"`
 	SubmissionDeadline *time.Time `gorm:"type:timestamptz" json:"submission_deadline,omitempty"` // nil = always open
 
 	// Configurable retention: auto-delete submissions older than N days.
@@ -36,9 +39,9 @@ type Organization struct {
 	// Email is a deliberate scope limit — we never send encrypted blobs over email.
 	NotificationEmail string `gorm:"size:255" json:"notification_email,omitempty"`
 
-	CreatedAt      time.Time    `json:"created_at"`
-	UpdatedAt      time.Time    `json:"updated_at"`
-	TeamMembers    []TeamMember `gorm:"foreignKey:OrganizationID" json:"team_members,omitempty"`
+	CreatedAt   time.Time    `json:"created_at"`
+	UpdatedAt   time.Time    `json:"updated_at"`
+	TeamMembers []TeamMember `gorm:"foreignKey:OrganizationID" json:"team_members,omitempty"`
 }
 
 // TeamMember represents a team member
@@ -56,16 +59,16 @@ type TeamMember struct {
 // the configured Action is executed (e.g. send an email).
 // The EncryptedConfig is stored encrypted with the org's public key.
 type DeadMansSwitch struct {
-	ID             uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	OrganizationID uuid.UUID `gorm:"type:uuid;not null;uniqueIndex" json:"organization_id"`
-	Enabled        bool      `gorm:"default:false" json:"enabled"`
-	TriggerDays    int       `gorm:"default:30" json:"trigger_days"` // Days without login before trigger
-	ActionType     string    `gorm:"size:50;default:'email'" json:"action_type"` // "email", "publish", "delete"
-	EncryptedConfig string  `gorm:"type:text" json:"-"` // JSON encrypted with org's public key
-	LastLoginAt    time.Time `json:"last_login_at"`      // Last time org logged in
-	TriggeredAt    *time.Time `json:"triggered_at,omitempty"` // When the switch last triggered
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID              uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	OrganizationID  uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex" json:"organization_id"`
+	Enabled         bool       `gorm:"default:false" json:"enabled"`
+	TriggerDays     int        `gorm:"default:30" json:"trigger_days"`             // Days without login before trigger
+	ActionType      string     `gorm:"size:50;default:'email'" json:"action_type"` // "email", "publish", "delete"
+	EncryptedConfig string     `gorm:"type:text" json:"-"`                         // JSON encrypted with org's public key
+	LastLoginAt     time.Time  `json:"last_login_at"`                              // Last time org logged in
+	TriggeredAt     *time.Time `json:"triggered_at,omitempty"`                     // When the switch last triggered
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // BeforeCreate generates ID and submission slug
@@ -107,12 +110,13 @@ func generateSubmissionSlug() string {
 }
 
 // GenerateAnonymousName creates a friendly anonymous identity for submitters.
-// Entropy: 64 adjectives × 64 animals × 36^4 suffix ≈ 34 billion combinations (~35 bits).
+// Entropy: 63 adjectives × 62 animals × 36^4 suffix ≈ 6.56 billion combinations (~32.6 bits).
+// (Corrected from earlier comment which miscalculated 64 × 64 × 36^4 as ~34 billion instead of ~6.88 billion).
 func GenerateAnonymousName() string {
 	adjectives := []string{
 		"Purple", "Green", "Blue", "Red", "Orange", "Silver", "Golden", "Crimson",
 		"Indigo", "Teal", "Amber", "Jade", "Coral", "Olive", "Plum", "Navy",
-		"Crimson", "Scarlet", "Ivory", "Onyx", "Copper", "Bronze", "Chrome", "Steel",
+		"Scarlet", "Ivory", "Onyx", "Copper", "Bronze", "Chrome", "Steel",
 		"Ember", "Frost", "Glacier", "Moss", "Cedar", "Pebble", "Dusk", "Dawn",
 		"Storm", "Gale", "Mist", "Fog", "Haze", "Cloud", "Rain", "Snow",
 		"Flame", "Spark", "Blaze", "Ash", "Soot", "Char", "Coal", "Cinder",
@@ -124,10 +128,10 @@ func GenerateAnonymousName() string {
 		"Hawk", "Lynx", "Falcon", "Otter", "Crane", "Robin", "Raven", "Deer",
 		"Swan", "Heron", "Wren", "Jay", "Finch", "Martin", "Swift", "Kite",
 		"Badger", "Marten", "Weasel", "Mink", "Hare", "Hedgehog", "Moose", "Elk",
-		"Puma", "Lynx", "Jaguar", "Leopard", "Cheetah", "Panther", "Cougar", "Bobcat",
+		"Puma", "Jaguar", "Leopard", "Cheetah", "Panther", "Cougar", "Bobcat",
 		"Salmon", "Trout", "Pike", "Perch", "Bass", "Carp", "Roach", "Dace",
 		"Ant", "Bee", "Crab", "Wasp", "Moth", "Flea", "Mite", "Slug",
-		"Tern", "Gull", "Duck", "Goose", "Swan", "Pigeon", "Dove", "Lark",
+		"Tern", "Gull", "Duck", "Goose", "Pigeon", "Dove", "Lark",
 	}
 
 	colorIdx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(adjectives))))
